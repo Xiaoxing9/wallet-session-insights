@@ -133,10 +133,15 @@ dim_completion = round(completed / total × 100) if tasks else 100
 
 A: tool_breadth (0–50)
   tool_types = distinct normalised tool names in tool_usage
-  1 type   →  0  (but if len(commands[]) > 50: floor at 10)
-  2–3      → 20
-  4–5      → 35
-  6+       → 50
+  cat_count  = len(exec_categories)   # 0 if field absent or empty
+
+  effective_types = max(tool_types, cat_count)
+
+  effective_types lookup:
+    1       →  0  (but if len(commands[]) > 50: floor at 10)
+    2–3     → 20
+    4–5     → 35
+    6+      → 50
 
 B: external_call_density (0–25)
   Count commands[] where command text contains "http://", "https://", or "api."
@@ -156,15 +161,16 @@ C: write_ratio (0–25)
 
 dim_depth = min(100, A + B + C)
 
-depth_label:
-  types ≥ 5, ext ≥ 6  → "deep integration"
-  types ≥ 5, write > 0.30  → "heavy authoring"
-  types ≥ 5             → "multi-tool"
-  types ≥ 4, ext ≥ 1   → "multi-tool + external"
-  types ≥ 4             → "multi-tool"
-  types 2–3, write > 0.10 → "read-write"
-  types 2–3             → "basic ops"
-  types = 1             → "read-only"
+depth_label (use effective_types for all checks):
+  effective_types ≥ 5, cat_count > tool_types → "diverse CLI"
+  effective_types ≥ 5, ext ≥ 6  → "deep integration"
+  effective_types ≥ 5, write > 0.30  → "heavy authoring"
+  effective_types ≥ 5             → "multi-tool"
+  effective_types ≥ 4, ext ≥ 1   → "multi-tool + external"
+  effective_types ≥ 4             → "multi-tool"
+  effective_types 2–3, write > 0.10 → "read-write"
+  effective_types 2–3             → "basic ops"
+  effective_types = 1             → "read-only"
 ```
 
 **dim_ux** — user experience smoothness:
