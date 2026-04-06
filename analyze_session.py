@@ -33,6 +33,100 @@ def parse_timestamp(ts_str):
     return int(datetime.fromisoformat(ts_str).timestamp() * 1000)
 
 
+# --- exec semantic classification ---
+
+TWO_TOKEN_CATEGORIES = {
+    "caw pact":      "wallet_pact",
+    "caw tx":        "wallet_tx",
+    "caw transfer":  "wallet_tx",
+    "caw track":     "wallet_track",
+    "caw onboard":   "wallet_setup",
+    "caw status":    "wallet_setup",
+    "caw wallet":    "wallet_setup",
+    "caw profile":   "wallet_setup",
+    "caw address":   "wallet_query",
+    "caw meta":      "wallet_query",
+    "caw schema":    "wallet_query",
+    "caw faucet":    "wallet_query",
+    "caw demo":      "wallet_query",
+    "caw balance":   "wallet_query",
+    "npm run":       "package_exec",
+    "npm install":   "package_exec",
+    "pnpm install":  "package_exec",
+    "pip install":   "package_exec",
+    "pip3 install":  "package_exec",
+    "git clone":     "git_ops",
+    "git push":      "git_ops",
+    "git pull":      "git_ops",
+    "git commit":    "git_ops",
+}
+
+ONE_TOKEN_CATEGORIES = {
+    "caw":      "wallet_query",
+    "curl":     "http_call",
+    "wget":     "http_call",
+    "npx":      "package_exec",
+    "npm":      "package_exec",
+    "pnpm":     "package_exec",
+    "pip":      "package_exec",
+    "pip3":     "package_exec",
+    "bash":     "script",
+    "python3":  "script",
+    "python":   "script",
+    "node":     "script",
+    "sh":       "script",
+    "cat":      "file_ops",
+    "ls":       "file_ops",
+    "find":     "file_ops",
+    "grep":     "file_ops",
+    "rg":       "file_ops",
+    "head":     "file_ops",
+    "tail":     "file_ops",
+    "tree":     "file_ops",
+    "wc":       "file_ops",
+    "mkdir":    "file_ops",
+    "cp":       "file_ops",
+    "mv":       "file_ops",
+    "rm":       "file_ops",
+    "git":      "git_ops",
+    "docker":   "infra",
+    "kubectl":  "infra",
+    "helm":     "infra",
+    "terraform": "infra",
+}
+
+
+def classify_exec_command(normalized_cmd):
+    """Classify a normalized exec command into a semantic category."""
+    if not normalized_cmd:
+        return "other"
+    tokens = normalized_cmd.split()
+    if not tokens:
+        return "other"
+    if len(tokens) >= 2:
+        two_token = f"{tokens[0]} {tokens[1]}"
+        if two_token in TWO_TOKEN_CATEGORIES:
+            return TWO_TOKEN_CATEGORIES[two_token]
+    if tokens[0] in ONE_TOKEN_CATEGORIES:
+        return ONE_TOKEN_CATEGORIES[tokens[0]]
+    return "other"
+
+
+def build_exec_categories(commands):
+    """Count exec commands by semantic category. Returns {category: count}."""
+    categories = {}
+    for cmd in commands:
+        if cmd.get("tool") != "exec":
+            continue
+        normalized = normalize_command(cmd.get("command", ""))
+        cat = classify_exec_command(normalized)
+        categories[cat] = categories.get(cat, 0) + 1
+    # Remove if only 'other' (no useful signal)
+    if len(categories) == 1 and "other" in categories:
+        return {}
+    return categories
+
+
 def detect_format(path):
     """
     Detect file format: JSONL (OpenClaw) or JSON array (Langfuse trace).
@@ -1622,6 +1716,8 @@ def analyze(path, since_arg=None, until_arg=None):
     message_costs = extract_message_costs(events)
     thinking = extract_thinking(events)
 
+    exec_categories = build_exec_categories(commands)
+
     output = {
         "session": session,
         "stats": stats,
@@ -1633,6 +1729,7 @@ def analyze(path, since_arg=None, until_arg=None):
         "errors": errors,
         "commands": strip_internal_fields(commands),
         "tool_usage": tool_usage,
+        "exec_categories": exec_categories,
         "conversation": conversation,
         "message_costs": message_costs,
         "thinking": thinking,
