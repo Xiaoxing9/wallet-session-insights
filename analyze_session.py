@@ -1063,7 +1063,8 @@ def detect_loops(commands, window=10, threshold=3):
     normalized = [normalize_command(c["command"]) for c in commands]
     loops = []
     reported = set()
-    polling_keywords = ("pending", "waiting", "running", "in progress")
+    polling_keywords = ("pending", "waiting", "wait", "running", "in progress",
+                        "generating", "queued", "polling", "checking")
 
     for i in range(len(normalized)):
         if normalized[i] in reported:
@@ -1079,14 +1080,20 @@ def detect_loops(commands, window=10, threshold=3):
         start_cmd = commands[group[0]]
         end_cmd = commands[group[-1]]
 
-        loop_type = "error_loop"
         all_zero_exit = all(commands[j]["exit_code"] == 0 for j in group)
+
+        # Classify loop type based on success status and polling indicators
         if all_zero_exit:
+            # All commands succeeded — check if polling or exploration
+            loop_type = "exploration_loop"  # default for successful repeats
             for cmd_idx in group:
                 output_text = commands[cmd_idx].get("output_text", "").lower()
                 if any(kw in output_text for kw in polling_keywords):
                     loop_type = "polling_loop"
                     break
+        else:
+            # At least one command failed — it's an error loop
+            loop_type = "error_loop"
 
         loops.append({
             "command_normalized": normalized[i],
