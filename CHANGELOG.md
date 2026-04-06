@@ -30,6 +30,24 @@
 - T3 (Claude Code CLI): 99 tool_calls ✅ (unchanged)
 - T4 (Langfuse trace): 134 tool_calls ✅ (newly verified)
 
+**Fix: `extract_conversation` empty for OpenClaw/CC-CLI sessions (found during 0404bugbash functional testing):**
+- Line 562: `e.get("type") != "message"` → `e.get("type") not in ("user", "assistant", "message")`
+- Root cause: v0.5.0 Langfuse multi-format changes accidentally narrowed the type guard to only `"message"`, but OpenClaw/CC-CLI events use `type: "user"` / `type: "assistant"`
+- Impact: `conversation[]` returned empty for all non-Langfuse sessions → task segmentation (Phase 2) worked from commands only, not dialogue
+- Verified: cfec0364 OpenClaw session → 0 → 64 conversation entries after fix
+
+**Fix: `detect_hallucinations` IndexError on empty command (found during 0404bugbash functional testing):**
+- Line 1541: `.split()[0]` → `(.split() or [""])[0]`
+- Triggered when `normalize_command()` returns empty string (e.g. Langfuse SPAN with empty input field)
+- Previously caused parser crash on traces bc255 and 65322
+
+**Fix: `active_duration_ms` redesign — event-type based, not threshold heuristic (M10):**
+- Previous approach: sum all inter-event gaps ≤ 5-minute threshold. Could not distinguish agent idle from human idle.
+- New approach for JSONL (OpenClaw/CC-CLI): subtract human idle gaps. A human idle gap = time from last `assistant` event to next `user` event carrying real human text (not a tool_result). Implemented as `compute_active_duration_jsonl(events)`.
+- New approach for Langfuse traces: sum durations of all `turn:N` spans. Each turn:N span covers one complete agent turn (LLM call + all tool executions). Implemented as `compute_active_duration_trace(raw_trace_data)`.
+- `analyze()` now detects Langfuse format before calling `load_events`, loads raw trace data, and overrides `session['active_duration_ms']` after `extract_session_meta` (which calls the JSONL path by default).
+- Verified: cfec0364 → 50.9m active of 2626.2m total (25 human turns, 2575m waiting for pact approval), trace-bc255 → 51.5m active of 98.2m total.
+
 **Fix: Loop classification bugs (found during functional testing):**
 - Default loop_type for all-success loops changed from `error_loop` to `exploration_loop`
 - polling_keywords expanded: added `"wait"`, `"generating"`, `"queued"`, `"polling"`, `"checking"`

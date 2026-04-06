@@ -22,7 +22,7 @@ If `--since` or `--until` was passed, include the range in the filename:
   Depth      <bar>  <dim_depth>  (<depth_label>)
   UX         <bar>  <dim_ux>
 ```
-**Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys>
+**Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys active>  *(wall-clock: <Xm Ys total>)*
 **User:** <user> | **CWD:** <cwd>
 [> *Generated in silent mode — no user input collected.*]
 [> *Time window: <HH:MM>–<HH:MM> — quality score covers this window only.*  (only when --since/--until)]

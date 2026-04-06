@@ -127,6 +127,76 @@ def build_exec_categories(commands):
     return categories
 
 
+def compute_active_duration_jsonl(events):
+    """
+    Compute agent-active duration for OpenClaw / CC-CLI JSONL sessions.
+
+    Human idle is defined as: gap between the last 'assistant' event and the
+    next 'user' event that carries real human text (not a tool_result).
+    These gaps represent time the agent is waiting for human input
+    (e.g. pact approval, user composing next message) and are subtracted
+    from the total wall-clock duration.
+
+    Returns active_duration_ms = total_ms - sum(human_idle_gaps).
+    """
+    def _is_human_text(e):
+        if e.get("type") != "user":
+            return False
+        msg = e.get("message", {})
+        content = msg.get("content", [])
+        if isinstance(content, str):
+            return bool(content.strip())
+        if isinstance(content, list):
+            types = [x.get("type") for x in content if isinstance(x, dict)]
+            return any(t == "text" for t in types) and "tool_result" not in types
+        return False
+
+    timed = sorted(
+        [e for e in events if e.get("timestamp")],
+        key=lambda e: parse_timestamp(e["timestamp"]),
+    )
+    if len(timed) < 2:
+        return 0
+
+    total_ms = parse_timestamp(timed[-1]["timestamp"]) - parse_timestamp(timed[0]["timestamp"])
+    human_idle_ms = 0
+    last_assistant_ts = None
+
+    for e in timed:
+        ts = parse_timestamp(e["timestamp"])
+        if e.get("type") == "assistant":
+            last_assistant_ts = ts
+        elif _is_human_text(e) and last_assistant_ts is not None:
+            human_idle_ms += ts - last_assistant_ts
+            last_assistant_ts = None
+
+    return max(0, total_ms - human_idle_ms)
+
+
+def compute_active_duration_trace(trace_data):
+    """
+    Compute agent-active duration for Langfuse trace format.
+
+    Langfuse spans have explicit startTime/endTime.  'turn:N' spans cover one
+    complete agent turn (LLM inference + all tool calls within that turn).
+    Summing turn-level span durations gives agent-active time without human
+    idle gaps (which fall between turns and are never captured in any span).
+
+    Returns active_duration_ms = sum of all turn:N span durations.
+    """
+    total = 0
+    for span in trace_data:
+        if span.get("type") not in ("SPAN", "GENERATION"):
+            continue
+        if not span.get("name", "").startswith("turn:"):
+            continue
+        start = span.get("startTime")
+        end = span.get("endTime")
+        if start and end:
+            total += max(0, parse_timestamp(end) - parse_timestamp(start))
+    return total
+
+
 def detect_format(path):
     """
     Detect file format: JSONL (OpenClaw) or JSON array (Langfuse trace).
@@ -370,6 +440,51 @@ def convert_trace_to_events(trace_data):
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
+        # OQ-09: Handle caw.* spans (no colon in name — skipped by M4 filter)
+        # Span names like "caw.address.create (abc123)" represent caw CLI tool calls.
+        # Convert base op to command text: "caw.address.create" -> "caw address create"
+        elif item_type == 'SPAN' and name.split('(')[0].strip().startswith('caw.'):
+            try:
+                base_op = name.split('(')[0].strip()  # e.g. "caw.address.create"
+                cmd_parts = base_op.replace('.', ' ')  # e.g. "caw address create"
+
+                # Use subcmd from input for full command text when available
+                input_data = item.get('input', {})
+                if isinstance(input_data, str) and input_data:
+                    try:
+                        input_data = json.loads(input_data)
+                    except (json.JSONDecodeError, TypeError, ValueError):
+                        input_data = {}
+                subcmd = input_data.get('subcmd', '') if isinstance(input_data, dict) else ''
+                cmd_text = f"caw {subcmd}" if subcmd else cmd_parts
+
+                tool_call_id = item.get('id', '')
+                tool_event = {
+                    "type": "tool_use",
+                    "toolCallId": tool_call_id,
+                    "toolName": "exec",
+                    "input": {"command": cmd_text, "exec_category": "caw"},
+                    "timestamp": item.get('startTime')
+                }
+                events.append(tool_event)
+
+                # Always emit a tool_result so the command is counted
+                output = item.get('output', '')
+                result_event = {
+                    "type": "tool_result",
+                    "toolCallId": tool_call_id,
+                    "exitCode": 0,  # DATA GAP: Langfuse caw.* spans have no output/metadata.
+                    # OpenClaw does not write caw results to Langfuse spans, so exit_code
+                    # and output are unavailable here. Recovery metric is blind to caw errors
+                    # in OpenClaw trace sessions. Fix requires OpenClaw to emit caw output
+                    # in span metadata when recording to Langfuse.
+                    "output": str(output) if output else '',
+                    "timestamp": item.get('endTime')
+                }
+                events.append(result_event)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+
     # Add final event for session end
     if session_end:
         events.append({
@@ -534,11 +649,17 @@ def extract_session_meta(events):
     # Matches /home/<user>/..., /Users/<user>/..., /root/...
     cwd = re.sub(r'^(/home/[^/]+|/Users/[^/]+|/root)', '~', cwd)
 
+    # Active duration: total wall-clock minus human idle time.
+    # Human idle = gap between last assistant event and next human-text user event.
+    # Langfuse traces override this value in analyze() using turn-span durations.
+    active_duration_ms = compute_active_duration_jsonl(events)
+
     return {
         "id": session_id,
         "start_time": events[0]["timestamp"],
         "end_time": last_event["timestamp"],
         "duration_ms": end_ms - start_ms,
+        "active_duration_ms": active_duration_ms,
         "cwd": cwd,
         "model": model,
         "provider": provider,
@@ -548,6 +669,8 @@ def extract_session_meta(events):
 
 def extract_text_from_content(content):
     """Extract plain text from a message content list, ignoring toolCall items."""
+    if isinstance(content, str):
+        return content.strip()
     parts = []
     for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
@@ -559,7 +682,9 @@ def extract_conversation(events):
     """Extract ordered user/assistant text exchanges. Skips tool-call-only turns."""
     conv = []
     for e in events:
-        if e.get("type") != "message":
+        # OpenClaw/CC-CLI: type is "user" or "assistant"
+        # Langfuse-converted: type may be "message"
+        if e.get("type") not in ("user", "assistant", "message"):
             continue
         msg = e.get("message", {})
         role = msg.get("role")
@@ -796,17 +921,40 @@ def extract_tool_calls_claude_code(events):
                         result_ts = event.get('timestamp', call_info['call_ts'])
                         result_ts_ms = parse_timestamp(result_ts)
 
-                        # Try to extract exit code from content
-                        exit_code = 0
-                        output_text = str(content)[:500] if isinstance(content, str) else ''
-                        error_text = ''
+                        # content is the outer user message content (list of tool_result blocks).
+                        # Find the specific tool_result matching this tool_call_id, then
+                        # extract text from its nested content.
+                        content_text = ''
+                        if isinstance(content, list):
+                            for tr in content:
+                                if (isinstance(tr, dict)
+                                        and tr.get('type') == 'tool_result'
+                                        and tr.get('tool_use_id') == tool_call_id):
+                                    inner = tr.get('content', '')
+                                    if isinstance(inner, str):
+                                        content_text = inner
+                                    elif isinstance(inner, list):
+                                        content_text = '\n'.join(
+                                            b['text'] for b in inner
+                                            if isinstance(b, dict) and b.get('type') == 'text'
+                                        )
+                                    break
+                        elif isinstance(content, str):
+                            content_text = content
 
-                        # Look for exit code markers
-                        if isinstance(content, str):
-                            if 'exit status' in content.lower() or 'error' in content.lower():
-                                exit_code = 1
-                            if 'not found' in content.lower() or 'command not found' in content.lower():
-                                exit_code = 127
+                        output_text = content_text[:500]
+                        error_text = ''
+                        exit_code = 0
+
+                        # Extract exit code: "Exit code N" (Claude Code CLI standard format)
+                        m = re.search(r'[Ee]xit\s+code\s+(\d+)', content_text)
+                        if m:
+                            exit_code = int(m.group(1))
+                        else:
+                            # Fallback: "EXIT: N" or "exit: N" from explicit echo $?
+                            m2 = re.search(r'[Ee][Xx][Ii][Tt]:\s*(\d+)', content_text)
+                            if m2:
+                                exit_code = int(m2.group(1))
 
                         duration_ms = result_ts_ms - call_info['call_ts_ms']
                         status = 'ok' if exit_code == 0 else 'error'
@@ -1177,16 +1325,17 @@ def detect_loops(commands, window=10, threshold=3):
         all_zero_exit = all(commands[j]["exit_code"] == 0 for j in group)
 
         # Classify loop type based on success status and polling indicators
-        if all_zero_exit:
-            # All commands succeeded — check if polling or exploration
-            loop_type = "exploration_loop"  # default for successful repeats
-            for cmd_idx in group:
-                output_text = commands[cmd_idx].get("output_text", "").lower()
-                if any(kw in output_text for kw in polling_keywords):
-                    loop_type = "polling_loop"
-                    break
+        # Check polling first: any exit=0 command with polling keywords → polling_loop
+        has_polling = any(
+            commands[j].get("exit_code", 0) == 0
+            and any(kw in commands[j].get("output_text", "").lower() for kw in polling_keywords)
+            for j in group
+        )
+        if has_polling:
+            loop_type = "polling_loop"
+        elif all_zero_exit:
+            loop_type = "exploration_loop"
         else:
-            # At least one command failed — it's an error loop
             loop_type = "error_loop"
 
         loops.append({
@@ -1206,7 +1355,248 @@ def detect_loops(commands, window=10, threshold=3):
     return loops
 
 
-def detect_wasted_calls(commands):
+def _normalize_caw_base(cmd_text):
+    """
+    Extract the base caw operation from a command string.
+    Returns a string like "caw address create" or None if not a caw command.
+
+    Examples:
+      "caw --format json address create --chain-id SETH" → "caw address create"
+      "caw address list" → "caw address list"
+      "caw onboard ..." → "caw onboard"
+      "ls ..." → None
+    """
+    import shlex
+    try:
+        tokens = shlex.split(cmd_text)
+    except ValueError:
+        tokens = cmd_text.split()
+
+    if not tokens or tokens[0] != "caw":
+        return None
+
+    # Strip flags and their values to get only subcommand tokens.
+    # Long flags (--flag) that are followed by a non-flag token consume that
+    # next token as the flag's value (e.g. --format json, --env sandbox).
+    # Boolean flags (--create-wallet, --yes) have no following value token.
+    subcommands = []
+    skip_next = False
+    for t in tokens[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if t.startswith("-"):
+            # Long flag — peek: if next token is a value (doesn't start with -), skip it
+            skip_next = t.startswith("--") and not t.startswith("---")
+            continue
+        subcommands.append(t)
+        if len(subcommands) >= 2:  # caw <subcmd> <op> is enough for base
+            break
+
+    if not subcommands:
+        return "caw"
+    return "caw " + " ".join(subcommands)
+
+
+def _caw_repeat_key(cmd_text):
+    """
+    Return a grouping key for caw_repeat detection.
+    Same as _normalize_caw_base but also preserves --chain-id value so that
+    `caw address create --chain-id SETH` and `caw address create --chain-id ETH`
+    are treated as different operations (OQ-11).
+    """
+    import re
+    base = _normalize_caw_base(cmd_text)
+    if base is None:
+        return None
+    m = re.search(r'--chain-id\s+(\S+)', cmd_text)
+    if m:
+        return base + " --chain-id " + m.group(1).upper()
+    return base
+
+
+def _detect_format_switch(commands, window_ms=60_000):
+    """
+    Detect caw commands that differ only in --format flag (e.g., try without --format json,
+    then add it). These are wasted because the agent should know the format flag upfront.
+
+    Returns list of wasted-call dicts (type='format_switch').
+    """
+    wasted = []
+    n = len(commands)
+    reported = set()
+
+    for i in range(n):
+        if i in reported:
+            continue
+        cmd_i = commands[i]
+        raw_i = cmd_i.get("command", "")
+        base_i = _normalize_caw_base(raw_i)
+        if base_i is None:
+            continue
+        ts_i = parse_timestamp(cmd_i.get("timestamp", ""))
+
+        # Look forward for same base with different --format presence
+        has_format_i = "--format" in raw_i
+        for j in range(i + 1, n):
+            if j in reported:
+                continue
+            cmd_j = commands[j]
+            raw_j = cmd_j.get("command", "")
+            base_j = _normalize_caw_base(raw_j)
+            if base_j != base_i:
+                continue
+            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
+            if ts_j - ts_i > window_ms:
+                break
+            has_format_j = "--format" in raw_j
+            if has_format_i != has_format_j:
+                # Same base, one has --format and one doesn't → the one without is wasted
+                wasted_idx = i if not has_format_i else j
+                if wasted_idx not in reported:
+                    reported.add(wasted_idx)
+                    wasted.append({
+                        "index": wasted_idx,
+                        "type": "format_switch",
+                        "command": commands[wasted_idx]["command"][:80],
+                        "reason": "same caw operation retried to add/remove --format json"
+                    })
+
+    return wasted
+
+
+def _detect_repeat_calls(commands, conversation=None, threshold=3):
+    """
+    Detect caw commands with the same base operation repeated >= threshold times
+    without a user message in between.  These are wasted (after the first).
+
+    Polling/read operations are excluded — repeating caw onboard, caw status,
+    caw wallet balance etc. is expected agent behaviour, not waste.
+
+    Returns list of wasted-call dicts (type='caw_repeat').
+    """
+    # Read/query ops that are legitimately polled in a loop — skip these.
+    # Also includes tx get (status polling) and faucet deposit (may target
+    # different addresses each time — indistinguishable from caw span alone).
+    _POLLING_OPS = {
+        'caw onboard', 'caw status', 'caw tx list', 'caw tx get',
+        'caw wallet balance', 'caw pact list', 'caw pact show',
+        'caw wallet get', 'caw wallet current', 'caw address list',
+        'caw wallet list', 'caw wallet pair', 'caw wallet pair status',
+        'caw meta chains', 'caw faucet tokens', 'caw faucet deposit',
+    }
+
+    wasted = []
+    n = len(commands)
+
+    # Build user message timestamps for interleave check
+    user_ts_list = []
+    if conversation:
+        for turn in conversation:
+            if turn.get("role") == "user":
+                ts = parse_timestamp(turn.get("timestamp", ""))
+                if ts > 0:
+                    user_ts_list.append(ts)
+
+    def has_user_msg_between(ts_a, ts_b):
+        for uts in user_ts_list:
+            if ts_a < uts < ts_b:
+                return True
+        return False
+
+    reported = set()
+    i = 0
+    while i < n:
+        cmd = commands[i]
+        raw = cmd.get("command", "")
+        base = _normalize_caw_base(raw)       # for POLLING_OPS membership check
+        key = _caw_repeat_key(raw)             # for grouping (preserves --chain-id)
+        if base is None or base in _POLLING_OPS:
+            i += 1
+            continue
+        ts_i = parse_timestamp(cmd.get("timestamp", ""))
+
+        # Collect consecutive-ish same-key run (no user msg in between)
+        run = [i]
+        j = i + 1
+        while j < n:
+            cmd_j = commands[j]
+            raw_j = cmd_j.get("command", "")
+            base_j = _normalize_caw_base(raw_j)
+            key_j = _caw_repeat_key(raw_j)
+            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
+            if key_j == key and not has_user_msg_between(ts_i, ts_j):
+                run.append(j)
+                ts_i = ts_j
+                j += 1
+            else:
+                j += 1
+                break
+
+        if len(run) >= threshold:
+            # First call is legitimate; subsequent ones are wasted
+            for k in run[1:]:
+                if k not in reported:
+                    reported.add(k)
+                    wasted.append({
+                        "index": k,
+                        "type": "caw_repeat",
+                        "command": commands[k]["command"][:80],
+                        "reason": f"same caw operation repeated {len(run)}x without user input"
+                    })
+            i = run[-1] + 1
+        else:
+            i += 1
+
+    return wasted
+
+
+def _detect_silent_fail_probe(commands, conversation=None, window_ms=90_000):
+    """
+    Detect the pattern: caw exits 0 but agent immediately probes
+    (curl/grep/cat) to verify, suggesting it suspected a silent failure.
+    The probe call itself is the wasted cost.
+
+    Returns list of wasted-call dicts (type='silent_fail_probe').
+    """
+    wasted = []
+    probe_cmds = {"curl", "grep", "cat", "jq", "python3", "python"}
+    n = len(commands)
+
+    for i in range(n - 1):
+        cmd_i = commands[i]
+        base_i = _normalize_caw_base(cmd_i.get("command", ""))
+        if base_i is None:
+            continue
+        if cmd_i.get("exit_code", 0) != 0:
+            continue  # explicit failure, not silent
+        ts_i = parse_timestamp(cmd_i.get("timestamp", ""))
+
+        # Check if next meaningful command is a probe within window
+        for j in range(i + 1, n):
+            cmd_j = commands[j]
+            raw_j = cmd_j.get("command", "")
+            base_j = raw_j.split()[0] if raw_j else ""
+            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
+            if ts_j - ts_i > window_ms:
+                break
+            if base_j in probe_cmds:
+                # Check if the probe references something caw-related
+                if any(kw in raw_j for kw in ["wallet", "address", "pact", "balance", "chain"]):
+                    wasted.append({
+                        "index": j,
+                        "type": "silent_fail_probe",
+                        "command": raw_j[:80],
+                        "reason": f"agent probing after caw exit-0 to verify result"
+                    })
+                    break
+            elif _normalize_caw_base(raw_j) is not None:
+                break  # next caw command, not a probe
+
+    return wasted
+
+
+def detect_wasted_calls(commands, conversation=None):
     """
     Scan commands[] for unnecessary calls.
     Returns dict with total, by_type counts, waste_ratio, and details[].
@@ -1216,6 +1606,9 @@ def detect_wasted_calls(commands):
     - help_exploration: --help or help subcommand
     - flag_trial_error: same normalised command, different raw command (flag changes), all fail
     - env_probing: which <tool> or find -name <tool>
+    - format_switch: caw command retried only to add/remove --format json  [M8]
+    - caw_repeat: same caw base operation repeated ≥3x without user input  [M8]
+    - silent_fail_probe: curl/grep probe immediately after caw exit-0       [M8]
 
     NOT wasted: --version, polling_loop, exploration_loop, successful duplicates, read-only.
     """
@@ -1232,7 +1625,7 @@ def detect_wasted_calls(commands):
         norm = normalized[i]
         raw = cmd.get("command", "")
         exit_code = cmd.get("exit_code", 0)
-        base_cmd = norm.split()[0] if norm else ""
+        base_cmd = (norm.split() or [""])[0] if norm else ""
 
         # Skip empty / read-only
         if not norm or base_cmd in read_only:
@@ -1271,13 +1664,17 @@ def detect_wasted_calls(commands):
             continue
 
         # === Type 2b: version_check ===
+        # Exempt: installation verification — version check immediately before first onboard
         if "--version" in raw or norm.endswith(" version") or norm == "version":
-            wasted.append({
-                "index": i,
-                "type": "version_check",
-                "command": raw[:80],
-                "reason": "agent probing tool version"
-            })
+            lookahead_norms = normalized[i+1:i+6]
+            is_install_verify = any("onboard" in n for n in lookahead_norms)
+            if not is_install_verify:
+                wasted.append({
+                    "index": i,
+                    "type": "version_check",
+                    "command": raw[:80],
+                    "reason": "agent probing tool version"
+                })
             i += 1
             continue
 
@@ -1302,22 +1699,43 @@ def detect_wasted_calls(commands):
                 continue
 
         # === Type 4: env_probing ===
+        # Exempt: first 5 commands of session = legitimate environment discovery
+        _SESSION_START_THRESHOLD = 5
         if base_cmd == "which" or (base_cmd == "find" and "-name" in raw):
-            wasted.append({
-                "index": i,
-                "type": "env_probing",
-                "command": raw[:80],
-                "reason": "agent searching for tool location"
-            })
+            if i >= _SESSION_START_THRESHOLD:
+                wasted.append({
+                    "index": i,
+                    "type": "env_probing",
+                    "command": raw[:80],
+                    "reason": "agent searching for tool location"
+                })
             i += 1
             continue
 
         i += 1
 
+    # === M8: caw-specific redundancy detectors ===
+    m8_indices = set(w["index"] for w in wasted)
+
+    for w in _detect_format_switch(commands):
+        if w["index"] not in m8_indices:
+            wasted.append(w)
+            m8_indices.add(w["index"])
+
+    for w in _detect_repeat_calls(commands, conversation):
+        if w["index"] not in m8_indices:
+            wasted.append(w)
+            m8_indices.add(w["index"])
+
+    for w in _detect_silent_fail_probe(commands, conversation):
+        if w["index"] not in m8_indices:
+            wasted.append(w)
+            m8_indices.add(w["index"])
+
     # Compute summary
     meaningful_count = sum(
         1 for i, c in enumerate(commands)
-        if normalized[i] and normalized[i].split()[0] not in read_only
+        if normalized[i] and (normalized[i].split() or [""])[0] not in read_only
     )
     by_type = {}
     for w in wasted:
@@ -1364,7 +1782,7 @@ def detect_recovery_quality(commands, max_attempts=2):
 
         norm = normalized[i]
         raw = cmd.get("command", "")
-        base = norm.split()[0] if norm else ""
+        base = (norm.split() or [""])[0] if norm else ""
         error_text = cmd.get("output_text", "").lower()
 
         # Skip empty / read-only failures
@@ -1538,7 +1956,7 @@ def detect_hallucinations(conversation, commands):
     for claim in claims:
         recent = [c for c in timed_cmds
                   if c["timestamp"] <= claim["timestamp"]
-                  and normalize_command(c.get("command", "")).split()[0] not in read_only]
+                  and (normalize_command(c.get("command", "")).split() or [""])[0] not in read_only]
         recent = recent[-5:]
 
         if not recent:
@@ -1690,6 +2108,12 @@ def apply_time_filter(events, since_ts=None, until_ts=None):
 
 
 def analyze(path, since_arg=None, until_arg=None):
+    file_format = detect_format(path)
+    raw_trace_data = None
+    if file_format == 'trace':
+        with open(path, 'r', encoding='utf-8') as f:
+            raw_trace_data = json.load(f)
+
     events = load_events(path)
     if not events:
         print(json.dumps({"error": "Empty session file"}), file=sys.stderr)
@@ -1705,12 +2129,18 @@ def analyze(path, since_arg=None, until_arg=None):
             sys.exit(1)
 
     session = extract_session_meta(events)
+
+    # M10: For Langfuse traces, override active_duration_ms using turn:N span durations
+    # (convert_trace_to_events loses the raw span timing; recompute from raw data)
+    if raw_trace_data is not None:
+        session['active_duration_ms'] = compute_active_duration_trace(raw_trace_data)
+
     commands, tool_usage, errors = extract_tool_calls(events)
     timing = calculate_timing(events, commands, session["duration_ms"])
     loops = detect_loops(commands)
-    wasted = detect_wasted_calls(commands)
-    recovery = detect_recovery_quality(commands)
     conversation = extract_conversation(events)
+    wasted = detect_wasted_calls(commands, conversation)
+    recovery = detect_recovery_quality(commands)
     hallucinations = detect_hallucinations(conversation, commands)
     stats = calculate_stats(events, commands, errors)
     message_costs = extract_message_costs(events)

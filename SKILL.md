@@ -27,7 +27,7 @@ You are helping an AI agent developer or product manager understand what happene
 ## Prerequisites
 
 - Python 3.10+ available on PATH
-- Parser: `~/.claude/skills/clawsession-insights/analyze_session.py`
+- Parser: `<SKILL_BASE_DIR>/analyze_session.py` (base directory is shown at the top of this skill)
 - No external Python dependencies required (stdlib only)
 
 ---
@@ -61,8 +61,10 @@ You are helping an AI agent developer or product manager understand what happene
 Run the Python parser to extract structured data from the JSONL:
 
 ```bash
-python3 ~/.claude/skills/clawsession-insights/analyze_session.py <input_path> [--since <arg>] [--until <arg>]
+python3 <SKILL_BASE_DIR>/analyze_session.py <input_path> [--since <arg>] [--until <arg>]
 ```
+
+`<SKILL_BASE_DIR>` is the **Base directory** shown at the top of this skill (e.g. `/Users/alice/.claude/skills/wallet-session-insights`). Use that path directly — do not hardcode a username.
 
 ⚠️ **If the parser file doesn't exist**, tell the user:
 > "Parser not found. Please install the skill first: https://github.com/jarosik9/openclaw-session-analysis"
@@ -236,7 +238,7 @@ Date:    <session.start_time>
 Model:   <session.model> (<session.provider>)
 User:    <session.user>
 CWD:     <session.cwd>
-Duration: <Xm Ys>
+Duration: <Xm Ys active>  (wall-clock: <Xm Ys total>)
 
 Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  <$X.XX/min or "—">/min
   Execution  <bar>  <dim_execution>
@@ -256,13 +258,13 @@ Timing
   Idle:  <Xm Ys>  (<pct>%)
 
 Tasks detected: <N>  (covers <Xm> of <Ym session>)
-  N. <title>  HH:MM→HH:MM  Xm  $X.XXX  eff:XX%  [x]/[ ] [⚠ high burn]
+  N. <title>  HH:MM→HH:MM  Xm  $X.XXX  [x]/[ ] [⚠ high burn]
 
 Loops detected: <count>
   • <command_normalized> × <count> (<loop_type>) — <Xm Ys>
 
 Operational Metrics
-  Waste:         <waste_ratio>% (<total>/<cmds> — <by_type summary>)
+  Waste:         <waste_ratio>% (<total>/<cmds> — <by_type summary: blind_retry/flag_trial_error/help_exploration/env_probing/format_switch/caw_repeat/silent_fail_probe>)
   Recovery:      <recovery_rate>% (<resolved> resolved, <unresolved> unresolved, <correctly_abandoned> abandoned)
   Hallucination: <hallucinations>/<total_claims> claims (<hallucination_rate>%) [🚨 if > 0]
 
