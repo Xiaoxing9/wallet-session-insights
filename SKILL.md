@@ -44,7 +44,7 @@ You are helping an AI agent developer or product manager understand what happene
 ## Quick Reference
 
 ```
-/analyze-session <path-to-session.jsonl> [--since HH:MM] [--until HH:MM] [--silent]
+/wallet-session-insights <path-to-session.jsonl> [--since HH:MM] [--until HH:MM] [--silent]
 ```
 
 | Parameter | Required | Description |
@@ -58,14 +58,14 @@ You are helping an AI agent developer or product manager understand what happene
 
 ## Phase 1 — Run the parser
 
-Run the Python parser to extract structured data from the JSONL:
+Run the Python parser to extract structured data from the session file:
 
 ```bash
 python3 <SKILL_BASE_DIR>/analyze_session.py <input_path> [--since <arg>] [--until <arg>]
 ```
 
 ⚠️ **If the parser file doesn't exist**, tell the user:
-> "Parser not found. Please install the skill first: https://github.com/jarosik9/clawsession-insights"
+> "Parser not found. Please install the skill first: https://github.com/jarosik9/wallet-session-insights"
 
 ⚠️ **If the parser exits non-zero**, show the error and stop.
 

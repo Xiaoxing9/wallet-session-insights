@@ -51,7 +51,8 @@ The parser and skill follow a consistent naming scheme: all output files are pla
 | Input format | Phase 1 output | Report output |
 |---|---|---|
 | `trace-XXXX.json` (Langfuse) | `trace-XXXX_parser_output.json` | `trace-XXXX_report.md` |
-| `session.jsonl` (OpenClaw / Claude Code CLI) | `session_parser_output.json` | `session_report.md` |
+| `session.jsonl` (OpenClaw / Claude Code CLI / Hermes) | `session_parser_output.json` | `session_report.md` |
+| `session.json` (Hermes) | `session_parser_output.json` | `session_report.md` |
 
 **Example:**
 
@@ -86,10 +87,10 @@ python3 analyze_session.py input.json > input_parser_output.json
 ## Installation
 
 ```bash
-git clone https://github.com/jarosik9/clawsession-insights/ ~/.claude/skills/clawsession-insights
+git clone https://github.com/jarosik9/wallet-session-insights/ ~/.claude/skills/wallet-session-insights
 ```
 
-> **Note:** The destination path must be exactly `~/.claude/skills/clawsession-insights`. The skill has this path hardcoded — cloning elsewhere or renaming the directory will cause a "Parser not found" error.
+> **Note:** The destination path must be exactly `~/.claude/skills/wallet-session-insights`. The skill has this path hardcoded — cloning elsewhere or renaming the directory will cause a "Parser not found" error.
 
 Restart Claude Code after cloning.
 
@@ -100,14 +101,14 @@ Restart Claude Code after cloning.
 In a Claude Code session:
 
 ```
-/clawsession-insights path/to/session.jsonl
+/wallet-session-insights path/to/session.jsonl
 ```
 
 The skill will:
 
 1. **Parse** the session file and display a stats summary in the terminal.
 2. **Ask questions** — 2–3 targeted questions based on the data (repeated commands, high error rates, abandoned tasks).
-3. **Write a report** to `path/to/session_analysis.md` incorporating your answers.
+3. **Write a report** to `path/to/session_report.md` incorporating your answers.
 
 ---
 
