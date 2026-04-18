@@ -1,10 +1,12 @@
-# clawsession-insights
+# wallet-session-insights
 
 A Claude Code skill that analyzes session logs and produces a structured Markdown report. Supports four session formats:
 - **OpenClaw** JSONL logs
 - **Claude Code CLI** JSONL logs
 - **Langfuse trace** JSON arrays
 - **Hermes Agent** JSON/JSONL logs
+
+Optimized for **Cobo Agentic Wallet** sessions: recognizes `caw` CLI commands, classifies wallet operations (transfer, pact, onboard, query), and uses wallet-specific categories for analysis.
 
 Point it at a session file (`.jsonl` or `.json`) and get a breakdown of what the agent did, where it got stuck, how time was spent, and what it cost.
 

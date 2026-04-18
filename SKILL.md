@@ -1,6 +1,6 @@
 ---
-name: analyze-session
-description: "Analyze OpenClaw, Claude Code CLI, Langfuse trace, or Hermes Agent session logs. MUST use when: user says 'analyze session', 'review my session', 'session report', 'what happened in this session', 'session quality', or provides a session file (.jsonl or .json). Segments tasks, scores agent quality (0-100), surfaces loops/errors/friction, asks targeted questions, writes a Markdown report. Supports four formats: OpenClaw JSONL, Claude Code CLI JSONL, Langfuse trace JSON, and Hermes Agent JSON/JSONL."
+name: wallet-session-insights
+description: "Analyze OpenClaw, Claude Code CLI, Langfuse trace, or Hermes Agent session logs. Optimized for Cobo Agentic Wallet sessions. MUST use when: user says 'analyze session', 'review my session', 'session report', 'what happened in this session', 'session quality', or provides a session file (.jsonl or .json). Segments tasks, scores agent quality (0-100), surfaces loops/errors/friction, asks targeted questions, writes a Markdown report. Supports four formats: OpenClaw JSONL, Claude Code CLI JSONL, Langfuse trace JSON, and Hermes Agent JSON/JSONL."
 ---
 
 # Session Analyzer
