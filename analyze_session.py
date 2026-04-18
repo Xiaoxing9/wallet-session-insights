@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Multi-format session analyzer: OpenClaw JSONL, Claude Code CLI JSONL, and Langfuse trace JSON.
+Multi-format session analyzer: OpenClaw JSONL, Claude Code CLI JSONL, Langfuse trace JSON, and Hermes JSON/JSONL.
 
-Supports three input formats:
+Supports four input formats:
   - OpenClaw JSONL: traditional log format from OpenClaw platform
   - Claude Code CLI JSONL: native Claude Code CLI session logs
   - Langfuse trace JSON: JSON array of SPAN/GENERATION items from Langfuse platform
+  - Hermes JSON/JSONL: Cobo Hermes agent sessions (OpenAI function-calling format)
 
 Usage:
   python3 analyze_session.py <path-to-session.jsonl|trace.json> [--since HH:MM] [--until HH:MM]
@@ -26,6 +27,35 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
 
+# Hermes tool name → internal tool type mapping
+HERMES_TOOL_MAP = {
+    'terminal':         'exec',
+    'read_file':        'read',
+    'write_file':       'write',
+    'patch':            'edit',
+    'search_files':     'read',
+    'execute_code':     'exec',
+    'skill_view':       'exec',
+    'skills_list':      'exec',
+    'skill_manage':     'exec',
+    'browser_navigate': 'web_fetch',
+    'browser_scroll':   'web_fetch',
+    'browser_click':    'web_fetch',
+    'browser_console':  'web_fetch',
+    'browser_snapshot': 'web_fetch',
+    'browser_get_images': 'web_fetch',
+    'todo':             'exec',
+    'memory':           'exec',
+    'clarify':          'exec',
+    'cronjob':          'exec',
+}
+
+
+# FIX: BUG-09 — map caw.* span names (CAW CLI operations in Langfuse format) to tool types
+# caw.* spans are recognized by prefix match (BUG-12), no explicit map needed.
+# All caw CLI operations map to tool type 'exec'.
+
+
 def parse_timestamp(ts_str):
     """Parse ISO timestamp string to epoch milliseconds."""
     if ts_str.endswith('Z'):
@@ -33,228 +63,87 @@ def parse_timestamp(ts_str):
     return int(datetime.fromisoformat(ts_str).timestamp() * 1000)
 
 
-# --- exec semantic classification ---
-
-TWO_TOKEN_CATEGORIES = {
-    "caw pact":      "wallet_pact",
-    "caw tx":        "wallet_tx",
-    "caw transfer":  "wallet_tx",
-    "caw track":     "wallet_track",
-    "caw onboard":   "wallet_setup",
-    "caw status":    "wallet_setup",
-    "caw wallet":    "wallet_setup",
-    "caw profile":   "wallet_setup",
-    "caw address":   "wallet_query",
-    "caw meta":      "wallet_query",
-    "caw schema":    "wallet_query",
-    "caw faucet":    "wallet_query",
-    "caw demo":      "wallet_query",
-    "caw balance":   "wallet_query",
-    "npm run":       "package_exec",
-    "npm install":   "package_exec",
-    "pnpm install":  "package_exec",
-    "pip install":   "package_exec",
-    "pip3 install":  "package_exec",
-    "git clone":     "git_ops",
-    "git push":      "git_ops",
-    "git pull":      "git_ops",
-    "git commit":    "git_ops",
-}
-
-ONE_TOKEN_CATEGORIES = {
-    "caw":      "wallet_query",
-    "curl":     "http_call",
-    "wget":     "http_call",
-    "npx":      "package_exec",
-    "npm":      "package_exec",
-    "pnpm":     "package_exec",
-    "pip":      "package_exec",
-    "pip3":     "package_exec",
-    "bash":     "script",
-    "python3":  "script",
-    "python":   "script",
-    "node":     "script",
-    "sh":       "script",
-    "cat":      "file_ops",
-    "ls":       "file_ops",
-    "find":     "file_ops",
-    "grep":     "file_ops",
-    "rg":       "file_ops",
-    "head":     "file_ops",
-    "tail":     "file_ops",
-    "tree":     "file_ops",
-    "wc":       "file_ops",
-    "mkdir":    "file_ops",
-    "cp":       "file_ops",
-    "mv":       "file_ops",
-    "rm":       "file_ops",
-    "git":      "git_ops",
-    "docker":   "infra",
-    "kubectl":  "infra",
-    "helm":     "infra",
-    "terraform": "infra",
-}
-
-
-def classify_exec_command(normalized_cmd):
-    """Classify a normalized exec command into a semantic category."""
-    if not normalized_cmd:
-        return "other"
-    tokens = normalized_cmd.split()
-    if not tokens:
-        return "other"
-    if len(tokens) >= 2:
-        two_token = f"{tokens[0]} {tokens[1]}"
-        if two_token in TWO_TOKEN_CATEGORIES:
-            return TWO_TOKEN_CATEGORIES[two_token]
-    if tokens[0] in ONE_TOKEN_CATEGORIES:
-        return ONE_TOKEN_CATEGORIES[tokens[0]]
-    return "other"
-
-
-def build_exec_categories(commands):
-    """Count exec commands by semantic category. Returns {category: count}."""
-    categories = {}
-    for cmd in commands:
-        if cmd.get("tool") != "exec":
-            continue
-        normalized = normalize_command(cmd.get("command", ""))
-        cat = classify_exec_command(normalized)
-        categories[cat] = categories.get(cat, 0) + 1
-    # Remove if only 'other' (no useful signal)
-    if len(categories) == 1 and "other" in categories:
-        return {}
-    return categories
-
-
-def compute_active_duration_jsonl(events):
-    """
-    Compute agent-active duration for OpenClaw / CC-CLI JSONL sessions.
-
-    Human idle is defined as: gap between the last 'assistant' event and the
-    next 'user' event that carries real human text (not a tool_result).
-    These gaps represent time the agent is waiting for human input
-    (e.g. pact approval, user composing next message) and are subtracted
-    from the total wall-clock duration.
-
-    Returns active_duration_ms = total_ms - sum(human_idle_gaps).
-    """
-    def _is_human_text(e):
-        if e.get("type") != "user":
-            return False
-        msg = e.get("message", {})
-        content = msg.get("content", [])
-        if isinstance(content, str):
-            return bool(content.strip())
-        if isinstance(content, list):
-            types = [x.get("type") for x in content if isinstance(x, dict)]
-            return any(t == "text" for t in types) and "tool_result" not in types
-        return False
-
-    timed = sorted(
-        [e for e in events if e.get("timestamp")],
-        key=lambda e: parse_timestamp(e["timestamp"]),
-    )
-    if len(timed) < 2:
-        return 0
-
-    total_ms = parse_timestamp(timed[-1]["timestamp"]) - parse_timestamp(timed[0]["timestamp"])
-    human_idle_ms = 0
-    last_assistant_ts = None
-
-    for e in timed:
-        ts = parse_timestamp(e["timestamp"])
-        if e.get("type") == "assistant":
-            last_assistant_ts = ts
-        elif _is_human_text(e) and last_assistant_ts is not None:
-            human_idle_ms += ts - last_assistant_ts
-            last_assistant_ts = None
-
-    return max(0, total_ms - human_idle_ms)
-
-
-def compute_active_duration_trace(trace_data):
-    """
-    Compute agent-active duration for Langfuse trace format.
-
-    Langfuse spans have explicit startTime/endTime.  'turn:N' spans cover one
-    complete agent turn (LLM inference + all tool calls within that turn).
-    Summing turn-level span durations gives agent-active time without human
-    idle gaps (which fall between turns and are never captured in any span).
-
-    Returns active_duration_ms = sum of all turn:N span durations.
-    """
-    total = 0
-    for span in trace_data:
-        if span.get("type") not in ("SPAN", "GENERATION"):
-            continue
-        if not span.get("name", "").startswith("turn:"):
-            continue
-        start = span.get("startTime")
-        end = span.get("endTime")
-        if start and end:
-            total += max(0, parse_timestamp(end) - parse_timestamp(start))
-    return total
-
-
 def detect_format(path):
     """
-    Detect file format: JSONL (OpenClaw) or JSON array (Langfuse trace).
-    Returns 'jsonl' or 'trace'.
+    Detect file format: JSONL, JSON array (Langfuse trace), or Hermes JSON object.
+    Returns 'jsonl', 'trace', or 'hermes-json'.
+
+    Hermes JSON files start with '{' + newline (multi-line JSON object).
+    JSONL files have a complete JSON object on each line.
+    Langfuse trace files start with '['.
     """
     with open(path, 'r', encoding='utf-8') as f:
-        first_line = f.readline().strip()
-        if first_line.startswith('['):
-            return 'trace'
-        elif first_line.startswith('{'):
+        first_line = f.readline()
+    first_stripped = first_line.strip()
+    if first_stripped.startswith('['):
+        return 'trace'
+    elif first_stripped == '{':
+        # Opening brace alone on a line → multi-line JSON object (Hermes JSON)
+        return 'hermes-json'
+    elif first_stripped.startswith('{'):
+        # Try to parse the first line as complete JSON (JSONL check)
+        try:
+            json.loads(first_stripped)
             return 'jsonl'
+        except json.JSONDecodeError:
+            return 'hermes-json'
     raise ValueError(f"Unrecognized format in {path}: expected JSONL or JSON array")
 
 
 def detect_jsonl_subformat(events):
     """
-    Detect JSONL subformat: OpenClaw vs Claude Code CLI.
-    Returns 'openclaw' or 'claude-code-cli'.
+    Detect JSONL subformat: OpenClaw, Claude Code CLI, or Hermes.
+    Returns 'openclaw', 'claude-code-cli', or 'hermes'.
 
-    Signals:
-    - Claude Code CLI: has "permission-mode" event OR "tool_use"/"tool_result" types
-    - OpenClaw: has "session" event type OR "toolCall" in message content
-
-    Note: Trace files converted to events have both 'session' and 'tool_use'/'tool_result'.
-    We prioritize 'tool_use'/'tool_result' detection since those uniquely identify CLI format.
+    Priority order:
+    1. Hermes: events use 'role' field (user/assistant/tool/session_meta) without 'type',
+       and assistant messages use tool_calls[] OpenAI function-calling format.
+    2. Claude Code CLI: has 'permission-mode', 'tool_use', or 'tool_result' event types.
+    3. OpenClaw: has 'session' event type or 'toolCall' in message content.
     """
     if not events:
-        return 'openclaw'  # Default fallback
+        return 'openclaw'
 
-    # First pass: check for CLI signals (highest priority - these indicate CLI or converted trace)
+    # First pass: check for Hermes signals (highest priority)
+    for event in events[:20]:
+        event_role = event.get('role', '')
+        event_type = event.get('type', '')
+        if event_role in ('session_meta', 'tool') and not event_type:
+            return 'hermes'
+        if event_role == 'assistant' and 'tool_calls' in event and not event_type:
+            return 'hermes'
+        if event_role == 'user' and not event_type and 'message' not in event:
+            # Hermes user events: {role, content, timestamp} — no 'type', no nested 'message'
+            # Peek further for assistant with tool_calls to confirm hermes
+            for e2 in events[:20]:
+                if e2.get('role') == 'assistant' and 'tool_calls' in e2:
+                    return 'hermes'
+            break  # user-without-type but no tool_calls found → not hermes
+
+    # Second pass: check for CLI signals
     for event in events[:20]:
         event_type = event.get('type', '')
         if event_type in ('permission-mode', 'tool_use', 'tool_result'):
             return 'claude-code-cli'
 
-    # Second pass: check for OpenClaw signals
+    # Third pass: check for OpenClaw signals
     for event in events[:20]:
         event_type = event.get('type', '')
-
         if event_type == 'session':
             return 'openclaw'
-
-        # Check message structure for Claude Code CLI tool_use/tool_result
         if event_type == 'message':
             msg = event.get('message', {})
-            # OpenClaw: toolCall in content
             content = msg.get('content', [])
             if isinstance(content, list):
                 for item in content:
                     if isinstance(item, dict) and item.get('type') == 'toolCall':
                         return 'openclaw'
 
-    # Default: if we see sessionId in many events, likely Claude Code CLI
     session_id_count = sum(1 for e in events[:10] if 'sessionId' in e)
     if session_id_count > 5:
         return 'claude-code-cli'
 
-    return 'openclaw'  # Default fallback
+    return 'openclaw'
 
 
 def convert_trace_to_events(trace_data):
@@ -345,22 +234,54 @@ def convert_trace_to_events(trace_data):
                 }
                 events.append(msg_event)
 
-                # Add output if present
-                if output_content and role == 'user':
+                # TURN output is the agent's synthesized visual reply to the user.
+                # Long outputs (>120 chars) are unique markdown summaries, not duplicates
+                # of GENERATION spans (which are brief pre-tool-call statements).
+                # Add as label "visual_reply" so Phase 2/4 can distinguish final summaries
+                # from intermediate reasoning.
+                if output_content and role == 'user' and len(str(output_content)) > 120:
                     events.append({
                         "type": "message",
                         "timestamp": item.get('endTime'),
                         "message": {
                             "role": "assistant",
-                            "content": [{"type": "text", "text": str(output_content)}] if output_content else [],
+                            "content": [{"type": "text", "text": str(output_content),
+                                         "label": "visual_reply"}],
                         }
                     })
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
-        # Extract token costs from GENERATION spans
+        # Extract text + token costs from GENERATION spans
         if item_type == 'GENERATION':
             try:
+                # FIX: BUG-08 — extract agent reasoning text from each GENERATION span
+                output_raw = item.get('output', '')
+                gen_text = ''
+                if output_raw:
+                    try:
+                        parsed = json.loads(output_raw) if isinstance(output_raw, str) else output_raw
+                        if isinstance(parsed, list) and parsed:
+                            # Format: ["agent text", "tool_name"]
+                            gen_text = str(parsed[0]) if parsed[0] else ''
+                        elif isinstance(parsed, str):
+                            gen_text = parsed
+                        elif isinstance(parsed, dict):
+                            gen_text = parsed.get('content', parsed.get('text', ''))
+                    except Exception:
+                        gen_text = str(output_raw) if output_raw else ''
+
+                if gen_text and gen_text.strip():
+                    events.append({
+                        "type": "message",
+                        "timestamp": item.get('startTime'),
+                        "message": {
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": gen_text.strip()}],
+                        }
+                    })
+
+                # Extract token costs
                 metadata_str = item.get('metadata', '{}')
                 if isinstance(metadata_str, str):
                     metadata = json.loads(metadata_str)
@@ -372,7 +293,6 @@ def convert_trace_to_events(trace_data):
                 output_tokens = int(attrs.get('gen_ai.usage.output_tokens', 0))
 
                 if input_tokens > 0 or output_tokens > 0:
-                    # Create a message event with usage info
                     events.append({
                         "type": "message",
                         "timestamp": item.get('startTime'),
@@ -381,7 +301,7 @@ def convert_trace_to_events(trace_data):
                             "content": [],
                             "usage": {
                                 "totalTokens": input_tokens + output_tokens,
-                                "cost": {"total": 0.0}  # Trace doesn't have cost info
+                                "cost": {"total": 0.0}
                             }
                         }
                     })
@@ -395,7 +315,13 @@ def convert_trace_to_events(trace_data):
                 tool_type = name.split(':')[0].lower()
 
                 # Recognize tool types from trace
-                if tool_type in ('exec', 'edit', 'read', 'write', 'web_fetch', 'web_search', 'skill_install', 'file_read', 'memory_search', 'process_poll', 'env_bootstrap'):
+                # FIX: BUG-10 — network_curl:exec and network_*:exec spans now recognized.
+                # tool_type is the prefix before the first colon (e.g. "network_curl" from
+                # "network_curl:exec (uuid)"). Map any network_* prefix to exec so it
+                # flows through the standard SPAN handling. tool_name in metadata (or the
+                # tool_type itself) is preserved so timeline shows "network_curl" not "exec".
+                _is_network = tool_type.startswith('network_')
+                if tool_type in ('exec', 'edit', 'read', 'write', 'web_fetch', 'web_search', 'skill_install', 'file_read', 'memory_search', 'process_poll', 'env_bootstrap') or _is_network:
                     # Parse metadata
                     metadata = {}
                     if 'metadata' in item:
@@ -413,8 +339,16 @@ def convert_trace_to_events(trace_data):
                         except (json.JSONDecodeError, TypeError, ValueError):
                             input_data = {'raw': input_data}
 
-                    # Normalize tool name for internal format
-                    normalized_tool = normalize_tool_name(metadata.get('tool_name', tool_type))
+                    # Normalize tool name for internal format.
+                    # FIX: BUG-10 — for network_* spans, prefer the span's tool_type prefix
+                    # (e.g. "network_curl") over metadata.tool_name (which is "exec") so
+                    # that timeline entries display the specific network tool, not generic exec.
+                    if _is_network:
+                        # Use category from metadata if present (e.g. "network_curl"), else tool_type
+                        _net_tool = metadata.get('category', tool_type)
+                        normalized_tool = normalize_tool_name(_net_tool)
+                    else:
+                        normalized_tool = normalize_tool_name(metadata.get('tool_name', tool_type))
 
                     # Create tool_use event
                     tool_call_id = metadata.get('tool_call_id', item.get('id', ''))
@@ -440,50 +374,50 @@ def convert_trace_to_events(trace_data):
             except (json.JSONDecodeError, TypeError, ValueError):
                 pass
 
-        # OQ-09: Handle caw.* spans (no colon in name — skipped by M4 filter)
-        # Span names like "caw.address.create (abc123)" represent caw CLI tool calls.
-        # Convert base op to command text: "caw.address.create" -> "caw address create"
-        elif item_type == 'SPAN' and name.split('(')[0].strip().startswith('caw.'):
-            try:
-                base_op = name.split('(')[0].strip()  # e.g. "caw.address.create"
-                cmd_parts = base_op.replace('.', ' ')  # e.g. "caw address create"
+        # FIX: BUG-09 — capture caw.* spans (CAW CLI operations in Langfuse format)
+        # FIX: BUG-12 — prefix match instead of exact match for caw.* spans
+        if item_type == 'SPAN' and '.' in name and ':' not in name:
+            caw_tool = name.split(' ')[0]  # strip trailing " (uuid)"
+            # Sanitize malformed span names (e.g. "caw.>/dev/null.2>&1;")
+            caw_tool_clean = caw_tool.split('>')[0].split('|')[0].split(';')[0].split('&')[0].strip()
+            if not caw_tool_clean or caw_tool_clean == 'caw.':
+                caw_tool_clean = 'caw.unknown'
+            if caw_tool_clean.startswith('caw.'):
+                try:
+                    output_str = item.get('output', '')
+                    output_text = output_str if isinstance(output_str, str) else json.dumps(output_str)
 
-                # Use subcmd from input for full command text when available
-                input_data = item.get('input', {})
-                if isinstance(input_data, str) and input_data:
-                    try:
-                        input_data = json.loads(input_data)
-                    except (json.JSONDecodeError, TypeError, ValueError):
-                        input_data = {}
-                subcmd = input_data.get('subcmd', '') if isinstance(input_data, dict) else ''
-                cmd_text = f"caw {subcmd}" if subcmd else cmd_parts
+                    # Infer exit code from output content
+                    exit_code = 0
+                    if output_text:
+                        if '"error": true' in output_text or 'INVALID_PARAMETER' in output_text or \
+                           'UNKNOWN_ERROR' in output_text or 'Command exited with code 1' in output_text:
+                            exit_code = 1
 
-                tool_call_id = item.get('id', '')
-                tool_event = {
-                    "type": "tool_use",
-                    "toolCallId": tool_call_id,
-                    "toolName": "exec",
-                    "input": {"command": cmd_text, "exec_category": "caw"},
-                    "timestamp": item.get('startTime')
-                }
-                events.append(tool_event)
+                    # Build command string: use caw_tool name + abbreviated input as context
+                    command_str = caw_tool_clean  # e.g. "caw.tx.call"
+                    input_raw = item.get('input', '')
+                    if input_raw:
+                        input_str = input_raw if isinstance(input_raw, str) else json.dumps(input_raw)
+                        command_str = f"{caw_tool_clean} {input_str[:200]}"
 
-                # Always emit a tool_result so the command is counted
-                output = item.get('output', '')
-                result_event = {
-                    "type": "tool_result",
-                    "toolCallId": tool_call_id,
-                    "exitCode": 0,  # DATA GAP: Langfuse caw.* spans have no output/metadata.
-                    # OpenClaw does not write caw results to Langfuse spans, so exit_code
-                    # and output are unavailable here. Recovery metric is blind to caw errors
-                    # in OpenClaw trace sessions. Fix requires OpenClaw to emit caw output
-                    # in span metadata when recording to Langfuse.
-                    "output": str(output) if output else '',
-                    "timestamp": item.get('endTime')
-                }
-                events.append(result_event)
-            except (json.JSONDecodeError, TypeError, ValueError):
-                pass
+                    events.append({
+                        "type": "tool_result",
+                        "timestamp": item.get('startTime'),
+                        "end_timestamp": item.get('endTime'),
+                        "tool": "exec",  # all caw.* spans are exec-type
+                        "tool_name": caw_tool_clean,
+                        "command": command_str,
+                        "output": output_text[:500] if output_text else '',
+                        "exit_code": exit_code,
+                        "duration_ms": int((
+                            parse_timestamp(item.get('endTime', '')) -
+                            parse_timestamp(item.get('startTime', ''))
+                        )) if item.get('startTime') and item.get('endTime') else 0,
+                        "status": "ok" if exit_code == 0 else "error",
+                    })
+                except Exception:
+                    pass
 
     # Add final event for session end
     if session_end:
@@ -495,17 +429,52 @@ def convert_trace_to_events(trace_data):
     return events if events else []
 
 
+def convert_hermes_json_to_events(path):
+    """
+    Convert Hermes JSON object format to a flat event list compatible with the rest of the parser.
+    Hermes JSON: single dict with session_id, model, platform, messages[], etc.
+    Returns a list of events in hermes-JSONL-compatible format.
+    """
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    base_ts = data.get('session_start', '')
+    session_id = data.get('session_id', Path(path).stem)
+
+    # Synthetic session_meta event (mirrors hermes JSONL first line)
+    events = [{
+        'role': 'session_meta',
+        'model': data.get('model', ''),
+        'platform': data.get('platform', ''),
+        'timestamp': base_ts,
+        'session_id': session_id,
+        '_hermes_json': True,
+    }]
+
+    for msg in data.get('messages', []):
+        event = dict(msg)
+        # JSON format has no per-message timestamps — use session_start as placeholder
+        if 'timestamp' not in event:
+            event['timestamp'] = base_ts
+        events.append(event)
+
+    return events
+
+
 def load_events(path):
-    """Load events from JSONL or trace JSON file. Returns list of dicts."""
+    """Load events from JSONL, trace JSON, or Hermes JSON file. Returns list of dicts."""
     file_format = detect_format(path)
 
     if file_format == 'trace':
-        # Load as JSON array and convert
         with open(path, 'r', encoding='utf-8') as f:
             trace_data = json.load(f)
         return convert_trace_to_events(trace_data)
+
+    elif file_format == 'hermes-json':
+        return convert_hermes_json_to_events(path)
+
     else:
-        # Load as JSONL
+        # JSONL: OpenClaw, Claude Code CLI, or Hermes JSONL
         events = []
         with open(path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -513,19 +482,20 @@ def load_events(path):
                 if line:
                     events.append(json.loads(line))
 
-        # M1: Unified timestamp bug fix
-        # Claude Code CLI JSONL has permission-mode event without timestamp as first event.
-        # Filter to keep only events starting from the first one with a timestamp.
-        first_ts_idx = 0
-        for i, e in enumerate(events):
-            if 'timestamp' in e:
-                first_ts_idx = i
-                break
-
-        events = events[first_ts_idx:]
+        # Hermes JSONL: first event may be session_meta (no timestamp) or user (has timestamp).
+        # Keep all events — session_meta is needed for metadata extraction.
+        # For non-hermes: filter to first event with timestamp (Claude Code CLI fix).
+        sub_format = detect_jsonl_subformat(events)
+        if sub_format != 'hermes':
+            first_ts_idx = 0
+            for i, e in enumerate(events):
+                if 'timestamp' in e:
+                    first_ts_idx = i
+                    break
+            events = events[first_ts_idx:]
 
         if not events:
-            raise ValueError(f"No events with timestamp found in {path}")
+            raise ValueError(f"No events found in {path}")
 
         return events
 
@@ -582,10 +552,27 @@ def extract_session_meta(events):
     # Detect format
     sub_format = detect_jsonl_subformat(events)
 
+    # Find last event with a real (non-placeholder) timestamp
     last_event = events[-1]
     end_ms = parse_timestamp(last_event["timestamp"])
 
-    if sub_format == 'claude-code-cli':
+    if sub_format == 'hermes':
+        meta = events[0] if events[0].get('role') == 'session_meta' else {}
+        session_id = meta.get('session_id', '')
+        model = meta.get('model', 'unknown')
+        platform = meta.get('platform', 'unknown')
+        base_ts = meta.get('timestamp', '') or events[0].get('timestamp', '')
+        # Find first non-meta event with timestamp for start
+        start_ts = next(
+            (e['timestamp'] for e in events if e.get('role') != 'session_meta' and e.get('timestamp')),
+            base_ts
+        )
+        start_ms = parse_timestamp(start_ts) if start_ts else end_ms
+        cwd = ''
+        provider = 'hermes'
+        user = f'hermes/{platform}' if platform and platform != 'unknown' else 'hermes'
+
+    elif sub_format == 'claude-code-cli':
         # Claude Code CLI format
         session_id = ""
         for e in events:
@@ -649,17 +636,11 @@ def extract_session_meta(events):
     # Matches /home/<user>/..., /Users/<user>/..., /root/...
     cwd = re.sub(r'^(/home/[^/]+|/Users/[^/]+|/root)', '~', cwd)
 
-    # Active duration: total wall-clock minus human idle time.
-    # Human idle = gap between last assistant event and next human-text user event.
-    # Langfuse traces override this value in analyze() using turn-span durations.
-    active_duration_ms = compute_active_duration_jsonl(events)
-
     return {
         "id": session_id,
         "start_time": events[0]["timestamp"],
         "end_time": last_event["timestamp"],
         "duration_ms": end_ms - start_ms,
-        "active_duration_ms": active_duration_ms,
         "cwd": cwd,
         "model": model,
         "provider": provider,
@@ -669,8 +650,6 @@ def extract_session_meta(events):
 
 def extract_text_from_content(content):
     """Extract plain text from a message content list, ignoring toolCall items."""
-    if isinstance(content, str):
-        return content.strip()
     parts = []
     for item in content:
         if isinstance(item, dict) and item.get("type") == "text":
@@ -678,13 +657,149 @@ def extract_text_from_content(content):
     return " ".join(parts).strip()
 
 
+def label_conversation_message(text):
+    """
+    Classify an assistant message by its semantic role in the execution flow.
+    Used to build timeline labels that help Phase 4 reasoning chain analysis.
+
+    Labels:
+      setup           - initial orientation: reading docs, checking status
+      pre_action      - agent states intent to execute something
+      post_failure    - agent reacts to a failed command (diagnosis attempt)
+      recovery_plan   - agent proposes alternative approach after failure
+      completion_claim - agent claims task success
+      reasoning       - general thinking that doesn't fit above
+    """
+    t = text.lower()
+
+    completion_signals = ['✅', '✓', 'success', 'successfully', 'completed',
+                          'transaction confirmed', 'transfer complete',
+                          '成功', '完成了', '已完成']
+    recovery_signals   = ['try another', 'try a different', 'instead', 'alternatively',
+                          'switch to', 'let me try', 'another approach',
+                          '换', '尝试另', '改用', '换一种', '换一个']
+    failure_signals    = ['failed', 'error', 'invalid', "doesn't work", 'not work',
+                          'incorrect', 'wrong', 'issue', 'problem', 'unable',
+                          'cannot', "can't",
+                          '失败', '错误', '不对', '问题', '无法', '不能']
+    action_signals     = ["let me", "i'll", "i will", "now i", "next i",
+                          "going to", "about to", "i'm going",
+                          '让我', '我来', '我会', '现在', '接下来', '接下来我']
+    setup_signals      = ['skill.md', 'onboarding', 'first', 'start by', 'begin',
+                          'let me check', 'checking', 'reading',
+                          '先查', '首先', '让我先', '先了解']
+
+    if any(s in text for s in completion_signals):
+        return 'completion_claim'
+    if any(s in t for s in recovery_signals):
+        return 'recovery_plan'
+    if any(s in t for s in failure_signals):
+        return 'post_failure'
+    if any(s in t for s in action_signals):
+        return 'pre_action'
+    if any(s in t for s in setup_signals):
+        return 'setup'
+    return 'reasoning'
+
+
+def build_timeline(conversation, commands, thinking=None):
+    """
+    Merge conversation and commands into a single chronological timeline.
+    Each entry is tagged with kind (thought/command) and a semantic label.
+    This is the primary input for Phase 4 reasoning chain analysis.
+
+    Thought labels: setup | pre_action | post_failure | recovery_plan |
+                    completion_claim | reasoning | user_input
+    Command flags:  is_critical=True for tx/pact submit calls
+    """
+    CRITICAL_TOOL_PREFIXES = ('caw.tx.', 'caw.pact.submit')
+    CRITICAL_TOOLS = {'caw.pact.submit', 'caw.pact.show', 'caw.tx.call',
+                      'caw.tx.transfer', 'caw.tx.speedup'}
+
+    events = []
+
+    for msg in conversation:
+        role = msg.get('role', 'assistant')
+        text = msg.get('text', '')
+        # Respect explicit label (e.g. visual_reply) over heuristic classification
+        explicit = msg.get('label')
+        if explicit:
+            label = explicit
+        elif role == 'assistant':
+            label = label_conversation_message(text)
+        else:
+            label = 'user_input'
+        events.append({
+            'ts': msg['timestamp'],
+            'kind': 'thought',
+            'role': role,
+            'label': label,
+            'text': text[:800] if label == 'visual_reply' else text[:400],
+        })
+
+    for cmd in commands:
+        tool_name = cmd.get('tool_name') or cmd.get('tool', '')
+        is_critical = (
+            any(tool_name.startswith(p) for p in CRITICAL_TOOL_PREFIXES) or
+            tool_name in CRITICAL_TOOLS or
+            (cmd.get('tool') == 'exec' and cmd.get('exit_code', 0) != 0)
+        )
+        events.append({
+            'ts': cmd.get('timestamp', ''),
+            'kind': 'command',
+            'tool': tool_name,
+            'command': cmd.get('command', '')[:120],
+            'exit_code': cmd.get('exit_code', 0),
+            'error_text': (cmd.get('error_text', '')[:200]
+                           if cmd.get('exit_code', 0) != 0 else ''),
+            'is_critical': is_critical,
+        })
+
+    # Merge thinking[] entries if provided (label: "thinking")
+    if thinking:
+        for t in thinking:
+            events.append({
+                'ts': t.get('timestamp', ''),
+                'kind': 'thought',
+                'role': 'assistant',
+                'label': 'thinking',
+                'text': t.get('text', '')[:400],
+            })
+
+    events.sort(key=lambda x: parse_timestamp(x['ts']) if x['ts'] else 0)
+    for i, e in enumerate(events):
+        e['seq'] = i + 1
+    return events
+
+
 def extract_conversation(events):
-    """Extract ordered user/assistant text exchanges. Skips tool-call-only turns."""
+    """Extract ordered user/assistant text exchanges. Skips tool-call-only turns.
+    Supports OpenClaw/CLI (type='message' with nested message.role) and
+    Hermes (role='user'/'assistant' directly on event).
+    Preserves 'label' field from content items (e.g. 'visual_reply' from TURN spans)."""
+    sub_format = detect_jsonl_subformat(events)
     conv = []
+
+    if sub_format == 'hermes':
+        for e in events:
+            role = e.get('role', '')
+            if role not in ('user', 'assistant'):
+                continue
+            content = e.get('content', '')
+            text = content if isinstance(content, str) else ''
+            if not text and isinstance(content, list):
+                text = extract_text_from_content(content)
+            if not text:
+                continue
+            conv.append({
+                'role': role,
+                'text': text,
+                'timestamp': e.get('timestamp', ''),
+            })
+        return sorted(conv, key=lambda x: parse_timestamp(x['timestamp']) if x['timestamp'] else 0)
+
     for e in events:
-        # OpenClaw/CC-CLI: type is "user" or "assistant"
-        # Langfuse-converted: type may be "message"
-        if e.get("type") not in ("user", "assistant", "message"):
+        if e.get("type") != "message":
             continue
         msg = e.get("message", {})
         role = msg.get("role")
@@ -694,11 +809,21 @@ def extract_conversation(events):
         text = extract_text_from_content(content)
         if not text:
             continue
-        conv.append({
+        # Preserve explicit label if set on any content item (e.g. visual_reply)
+        explicit_label = None
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("label"):
+                    explicit_label = item["label"]
+                    break
+        entry = {
             "role": role,
             "text": text,
             "timestamp": e["timestamp"],
-        })
+        }
+        if explicit_label:
+            entry["label"] = explicit_label
+        conv.append(entry)
     return sorted(conv, key=lambda x: parse_timestamp(x["timestamp"]))
 
 
@@ -810,6 +935,13 @@ def extract_tool_calls_openclaw(events):
             "timestamp": call["call_ts"],
             "output_text": output_text,
         }
+        # IMPROVE: Improvement-4 — for process tool commands, add process_action field
+        if entry.get('tool') == 'process':
+            try:
+                action = json.loads(entry.get('command', '{}')).get('action', '')
+                entry['process_action'] = action
+            except:
+                entry['process_action'] = ''
         commands.append(entry)
 
         if exit_code != 0:
@@ -921,40 +1053,17 @@ def extract_tool_calls_claude_code(events):
                         result_ts = event.get('timestamp', call_info['call_ts'])
                         result_ts_ms = parse_timestamp(result_ts)
 
-                        # content is the outer user message content (list of tool_result blocks).
-                        # Find the specific tool_result matching this tool_call_id, then
-                        # extract text from its nested content.
-                        content_text = ''
-                        if isinstance(content, list):
-                            for tr in content:
-                                if (isinstance(tr, dict)
-                                        and tr.get('type') == 'tool_result'
-                                        and tr.get('tool_use_id') == tool_call_id):
-                                    inner = tr.get('content', '')
-                                    if isinstance(inner, str):
-                                        content_text = inner
-                                    elif isinstance(inner, list):
-                                        content_text = '\n'.join(
-                                            b['text'] for b in inner
-                                            if isinstance(b, dict) and b.get('type') == 'text'
-                                        )
-                                    break
-                        elif isinstance(content, str):
-                            content_text = content
-
-                        output_text = content_text[:500]
-                        error_text = ''
+                        # Try to extract exit code from content
                         exit_code = 0
+                        output_text = str(content)[:500] if isinstance(content, str) else ''
+                        error_text = ''
 
-                        # Extract exit code: "Exit code N" (Claude Code CLI standard format)
-                        m = re.search(r'[Ee]xit\s+code\s+(\d+)', content_text)
-                        if m:
-                            exit_code = int(m.group(1))
-                        else:
-                            # Fallback: "EXIT: N" or "exit: N" from explicit echo $?
-                            m2 = re.search(r'[Ee][Xx][Ii][Tt]:\s*(\d+)', content_text)
-                            if m2:
-                                exit_code = int(m2.group(1))
+                        # Look for exit code markers
+                        if isinstance(content, str):
+                            if 'exit status' in content.lower() or 'error' in content.lower():
+                                exit_code = 1
+                            if 'not found' in content.lower() or 'command not found' in content.lower():
+                                exit_code = 127
 
                         duration_ms = result_ts_ms - call_info['call_ts_ms']
                         status = 'ok' if exit_code == 0 else 'error'
@@ -968,6 +1077,13 @@ def extract_tool_calls_claude_code(events):
                             'timestamp': call_info['call_ts'],
                             'output_text': output_text,
                         }
+                        # IMPROVE: Improvement-4 — for process tool commands, add process_action field
+                        if entry.get('tool') == 'process':
+                            try:
+                                action = json.loads(entry.get('command', '{}')).get('action', '')
+                                entry['process_action'] = action
+                            except:
+                                entry['process_action'] = ''
                         commands.append(entry)
 
                         if exit_code != 0:
@@ -994,6 +1110,13 @@ def extract_tool_calls_claude_code(events):
             'timestamp': call_info['call_ts'],
             'output_text': '',
         }
+        # IMPROVE: Improvement-4 — for process tool commands, add process_action field
+        if entry.get('tool') == 'process':
+            try:
+                action = json.loads(entry.get('command', '{}')).get('action', '')
+                entry['process_action'] = action
+            except:
+                entry['process_action'] = ''
         commands.append(entry)
 
     return commands, tool_usage, errors
@@ -1078,6 +1201,59 @@ def extract_tool_calls_trace(events):
             'timestamp': call_ts,
             'output_text': output_text,
         }
+        # IMPROVE: Improvement-4 — for process tool commands, add process_action field
+        # extracted from the command JSON so downstream consumers can distinguish
+        # poll/log (monitoring) from list/kill/create_pact/submit (execution).
+        if tool_name == 'process':
+            try:
+                action = json.loads(entry.get('command', '{}')).get('action', '')
+                entry['process_action'] = action
+            except:
+                entry['process_action'] = ''
+        commands.append(entry)
+
+        if exit_code != 0:
+            errors.append({
+                'command': command,
+                'exit_code': exit_code,
+                'error_text': output_text[:200] if output_text else '',
+                'timestamp': call_ts,
+            })
+
+    # FIX: BUG-09 — third pass: collect standalone caw.* tool_result events
+    # These are emitted by convert_trace_to_events with tool_name but no toolCallId.
+    for event in events:
+        if event.get('type') != 'tool_result':
+            continue
+        tool_name = event.get('tool_name', '')
+        if not tool_name or not tool_name.startswith('caw.'):
+            continue
+        # Skip events that were already processed as paired tool_result (have toolCallId)
+        if event.get('toolCallId'):
+            continue
+
+        call_ts = event.get('timestamp', '')
+        if not call_ts:
+            continue
+
+        tool_usage[tool_name] = tool_usage.get(tool_name, 0) + 1
+
+        exit_code = event.get('exit_code', 0)
+        output_text = event.get('output', '')[:500]
+        command = event.get('command', tool_name)
+        duration_ms = event.get('duration_ms', 0)
+        status = event.get('status', 'ok' if exit_code == 0 else 'error')
+
+        entry = {
+            'tool': event.get('tool', 'exec'),
+            'tool_name': tool_name,
+            'command': command,
+            'exit_code': exit_code,
+            'duration_ms': duration_ms,
+            'status': status,
+            'timestamp': call_ts,
+            'output_text': output_text,
+        }
         commands.append(entry)
 
         if exit_code != 0:
@@ -1091,12 +1267,134 @@ def extract_tool_calls_trace(events):
     return commands, tool_usage, errors
 
 
+def extract_tool_calls_hermes(events):
+    """
+    Extract tool calls from Hermes format (OpenAI function-calling style).
+    - assistant messages: tool_calls[].function.{name, arguments}
+    - tool result messages: role="tool", tool_call_id, content (JSON string)
+    - terminal results: content is JSON with {output, exit_code, error}
+    Returns: (commands, tool_usage, errors)
+    """
+    result_map = {}  # tool_call_id → result event
+    for event in events:
+        if event.get('role') == 'tool':
+            tcid = event.get('tool_call_id', '')
+            if tcid:
+                result_map[tcid] = event
+
+    commands = []
+    tool_usage = {}
+    errors = []
+
+    for event in events:
+        if event.get('role') != 'assistant':
+            continue
+        call_ts = event.get('timestamp', '')
+        for tc in event.get('tool_calls', []):
+            fn = tc.get('function', {})
+            tool_name_raw = fn.get('name', '')
+            if not tool_name_raw:
+                continue
+
+            tool_usage[tool_name_raw] = tool_usage.get(tool_name_raw, 0) + 1
+            tool_type = HERMES_TOOL_MAP.get(tool_name_raw, 'exec')
+
+            try:
+                args = json.loads(fn.get('arguments', '{}'))
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+
+            command_str = _hermes_command_str(tool_name_raw, args)
+            tcid = tc.get('id', '')
+
+            exit_code = 0
+            error_text = ''
+            result_ts = call_ts
+            duration_ms = 0
+
+            if tcid in result_map:
+                result_event = result_map[tcid]
+                result_ts = result_event.get('timestamp', call_ts)
+                if call_ts and result_ts and call_ts != result_ts:
+                    try:
+                        duration_ms = parse_timestamp(result_ts) - parse_timestamp(call_ts)
+                    except (ValueError, KeyError):
+                        duration_ms = 0
+
+                content = result_event.get('content', '')
+                if content:
+                    try:
+                        result_data = json.loads(content) if isinstance(content, str) else content
+                        if isinstance(result_data, dict):
+                            exit_code = result_data.get('exit_code', 0)
+                            err = result_data.get('error', '')
+                            if err:
+                                error_text = str(err)[:200]
+                    except (json.JSONDecodeError, TypeError):
+                        content_lower = str(content).lower()
+                        if any(s in content_lower for s in ('error:', 'exception:', 'not found', 'permission denied')):
+                            exit_code = 1
+
+            cmd_entry = {
+                'tool': tool_type,
+                'tool_name': tool_name_raw,
+                'command': command_str,
+                'exit_code': exit_code,
+                'duration_ms': duration_ms,
+                'status': 'ok' if exit_code == 0 else 'error',
+                'timestamp': call_ts,
+                'output_text': '',
+            }
+            commands.append(cmd_entry)
+
+            if exit_code != 0:
+                errors.append({
+                    'command': command_str,
+                    'exit_code': exit_code,
+                    'error_text': error_text,
+                    'timestamp': call_ts,
+                })
+
+    return commands, tool_usage, errors
+
+
+def _hermes_command_str(tool_name, args):
+    """Build a human-readable command string from Hermes tool arguments."""
+    if tool_name == 'terminal':
+        return args.get('command', '')
+    elif tool_name in ('read_file', 'search_files'):
+        return args.get('path', args.get('query', ''))
+    elif tool_name in ('write_file', 'patch'):
+        return args.get('path', '')
+    elif tool_name in ('skill_view', 'skill_manage', 'skills_list'):
+        name = args.get('name', '')
+        return f"{tool_name} {name}".strip()
+    elif tool_name == 'browser_navigate':
+        return args.get('url', '')
+    elif tool_name == 'execute_code':
+        lang = args.get('language', 'python')
+        code = args.get('code', '')[:60]
+        return f"execute_code ({lang}): {code}"
+    elif tool_name == 'cronjob':
+        return f"cronjob {args.get('action', '')} {args.get('name', '')}".strip()
+    else:
+        for v in args.values():
+            if isinstance(v, str) and v:
+                return f"{tool_name}: {v[:80]}"
+        return tool_name
+
+
 def extract_tool_calls(events):
     """
     Extract all tool calls with their results.
-    Supports OpenClaw, Claude Code CLI, and trace-converted formats.
+    Supports OpenClaw, Claude Code CLI, Hermes, and trace-converted formats.
     Returns: (commands, tool_usage, errors)
     """
+    # Check for Hermes format first (role-based, no 'type' field)
+    sub_format = detect_jsonl_subformat(events)
+    if sub_format == 'hermes':
+        return extract_tool_calls_hermes(events)
+
     # Single pass: check for format signals
     has_standalone_tool_events = False
     has_embedded_tool_events = False
@@ -1297,306 +1595,143 @@ def detect_loops(commands, window=10, threshold=3):
     Detect loops: same normalized command >= threshold times in any window-sized slice.
     Classification uses toolResult output_text:
     - polling_loop: exit_code==0 AND output contains "pending"/"waiting"/"running"/"in progress"
-    - error_loop: everything else
+    - error_loop: at least one exit_code != 0
+    - exploration_loop: all exit_code==0 and no polling keywords found (NEW: BUG-01)
+
+    FIX: BUG-02 — write/edit/read tool calls are excluded from loop detection.
+    They are tracked separately as write_iterations.
     """
     if not commands:
-        return []
+        return [], []  # loops, write_iterations
 
-    normalized = [normalize_command(c["command"]) for c in commands]
+    # FIX: BUG-02 — exclude write/edit/read tools from loop detection candidates
+    LOOP_EXCLUDED_TOOLS = {"write", "edit", "read"}
+    loop_commands = [(i, c) for i, c in enumerate(commands) if c.get("tool", "") not in LOOP_EXCLUDED_TOOLS]
+
+    # Build normalized list aligned to loop_commands indices
+    normalized_lc = [normalize_command(c["command"]) for _, c in loop_commands]
+
     loops = []
     reported = set()
-    polling_keywords = ("pending", "waiting", "wait", "running", "in progress",
-                        "generating", "queued", "polling", "checking")
+    polling_keywords = ("pending", "waiting", "running", "in progress")
 
-    for i in range(len(normalized)):
-        if normalized[i] in reported:
+    for li in range(len(normalized_lc)):
+        if normalized_lc[li] in reported:
             continue
-        window_slice = normalized[i:i + window]
-        count = window_slice.count(normalized[i])
+        window_slice = normalized_lc[li:li + window]
+        count = window_slice.count(normalized_lc[li])
         if count < threshold:
             continue
 
-        matching_indices = [j for j, n in enumerate(normalized) if n == normalized[i]]
-        group = [j for j in matching_indices if i <= j < i + window]
+        matching_li = [lj for lj, n in enumerate(normalized_lc) if n == normalized_lc[li]]
+        group_li = [lj for lj in matching_li if li <= lj < li + window]
 
-        start_cmd = commands[group[0]]
-        end_cmd = commands[group[-1]]
+        start_cmd = loop_commands[group_li[0]][1]
+        end_cmd = loop_commands[group_li[-1]][1]
 
-        all_zero_exit = all(commands[j]["exit_code"] == 0 for j in group)
+        all_zero_exit = all(loop_commands[lj][1]["exit_code"] == 0 for lj in group_li)
 
-        # Classify loop type based on success status and polling indicators
-        # Check polling first: any exit=0 command with polling keywords → polling_loop
-        has_polling = any(
-            commands[j].get("exit_code", 0) == 0
-            and any(kw in commands[j].get("output_text", "").lower() for kw in polling_keywords)
-            for j in group
-        )
-        if has_polling:
-            loop_type = "polling_loop"
-        elif all_zero_exit:
-            loop_type = "exploration_loop"
-        else:
-            loop_type = "error_loop"
+        loop_type = "error_loop"
+        if all_zero_exit:
+            found_polling = False
+            for lj in group_li:
+                output_text = loop_commands[lj][1].get("output_text", "").lower()
+                if any(kw in output_text for kw in polling_keywords):
+                    loop_type = "polling_loop"
+                    found_polling = True
+                    break
+            # FIX: BUG-01 — all-zero exit with no polling keywords → exploration_loop
+            if not found_polling:
+                loop_type = "exploration_loop"
 
-        loops.append({
-            "command_normalized": normalized[i],
+        # IMPROVE: Improvement-3 — refine error_loop into debugging_loop when edit/write commands
+        # are interspersed between repeated commands in the window.
+        # debugging_loop: agent is actively modifying code/config between retries (expected behavior).
+        # error_loop: agent retries without any modification (blind retry — worse behavior).
+        if loop_type == "error_loop":
+            # Get original indices of all commands in the window (group_li are loop_commands indices)
+            orig_start = loop_commands[group_li[0]][0]
+            orig_end = loop_commands[group_li[-1]][0]
+            # Check if any write/edit tool calls exist between first and last repeated command
+            has_edit_between = any(
+                commands[oi].get("tool", "") in ("write", "edit")
+                for oi in range(orig_start, orig_end + 1)
+            )
+            if has_edit_between:
+                loop_type = "debugging_loop"
+
+        # IMPROVE: Improvement-4 — for process tool loops, add process_action to example_command context
+        # Also ensure process:poll/log loops remain polling_loop (they won't have polling keywords
+        # in output_text, but their action field makes intent clear).
+        loop_entry = {
+            "command_normalized": normalized_lc[li],
             "example_command": start_cmd["command"],
             "loop_type": loop_type,
-            "count": len(group),
+            "count": len(group_li),
             "start_time": start_cmd["timestamp"],
             "end_time": end_cmd["timestamp"],
             "duration_ms": (
                 parse_timestamp(end_cmd["timestamp"]) -
                 parse_timestamp(start_cmd["timestamp"])
             ),
-        })
-        reported.add(normalized[i])
+        }
+        if start_cmd.get("tool") == "process":
+            # Extract process_action from the start command (already populated by extractor)
+            pa = start_cmd.get("process_action", "")
+            if not pa:
+                try:
+                    pa = json.loads(start_cmd.get("command", "{}" )).get("action", "")
+                except:
+                    pa = ""
+            loop_entry["process_action"] = pa
+            # Ensure process:poll/log loops are classified as polling_loop
+            if pa in ("poll", "log") and loop_type not in ("polling_loop",):
+                loop_entry["loop_type"] = "polling_loop"
+        loops.append(loop_entry)
+        reported.add(normalized_lc[li])
 
-    return loops
+    # FIX: BUG-02 — detect write_iterations (same path written >= 3 times)
+    # Use regex instead of json.loads because command strings may be truncated
+    from collections import Counter
+    import re as _re
+    path_counts = Counter()
+    for cmd in commands:
+        if cmd.get("tool", "") in ("write", "edit"):
+            m = _re.search(r'"path"\s*:\s*"([^"]+)"', cmd.get("command", ""))
+            if m:
+                path_counts[m.group(1)] += 1
+
+    write_iterations = [
+        {"path": path, "count": count, "note": "iterative development"}
+        for path, count in path_counts.items()
+        if count >= 3
+    ]
+
+    return loops, write_iterations
 
 
-def _normalize_caw_base(cmd_text):
+def is_meaningful_command(cmd):
     """
-    Extract the base caw operation from a command string.
-    Returns a string like "caw address create" or None if not a caw command.
-
-    Examples:
-      "caw --format json address create --chain-id SETH" → "caw address create"
-      "caw address list" → "caw address list"
-      "caw onboard ..." → "caw onboard"
-      "ls ..." → None
+    Return True if command counts as a meaningful action for efficiency/waste calculations.
+    Excludes:
+    - 'read' tool calls (read-only file access)
+    - 'process' tool calls where action is 'poll' or 'log' (background process monitoring)
     """
-    import shlex
-    try:
-        tokens = shlex.split(cmd_text)
-    except ValueError:
-        tokens = cmd_text.split()
-
-    if not tokens or tokens[0] != "caw":
-        return None
-
-    # Strip flags and their values to get only subcommand tokens.
-    # Long flags (--flag) that are followed by a non-flag token consume that
-    # next token as the flag's value (e.g. --format json, --env sandbox).
-    # Boolean flags (--create-wallet, --yes) have no following value token.
-    subcommands = []
-    skip_next = False
-    for t in tokens[1:]:
-        if skip_next:
-            skip_next = False
-            continue
-        if t.startswith("-"):
-            # Long flag — peek: if next token is a value (doesn't start with -), skip it
-            skip_next = t.startswith("--") and not t.startswith("---")
-            continue
-        subcommands.append(t)
-        if len(subcommands) >= 2:  # caw <subcmd> <op> is enough for base
-            break
-
-    if not subcommands:
-        return "caw"
-    return "caw " + " ".join(subcommands)
-
-
-def _caw_repeat_key(cmd_text):
-    """
-    Return a grouping key for caw_repeat detection.
-    Same as _normalize_caw_base but also preserves --chain-id value so that
-    `caw address create --chain-id SETH` and `caw address create --chain-id ETH`
-    are treated as different operations (OQ-11).
-    """
-    import re
-    base = _normalize_caw_base(cmd_text)
-    if base is None:
-        return None
-    m = re.search(r'--chain-id\s+(\S+)', cmd_text)
-    if m:
-        return base + " --chain-id " + m.group(1).upper()
-    return base
-
-
-def _detect_format_switch(commands, window_ms=60_000):
-    """
-    Detect caw commands that differ only in --format flag (e.g., try without --format json,
-    then add it). These are wasted because the agent should know the format flag upfront.
-
-    Returns list of wasted-call dicts (type='format_switch').
-    """
-    wasted = []
-    n = len(commands)
-    reported = set()
-
-    for i in range(n):
-        if i in reported:
-            continue
-        cmd_i = commands[i]
-        raw_i = cmd_i.get("command", "")
-        base_i = _normalize_caw_base(raw_i)
-        if base_i is None:
-            continue
-        ts_i = parse_timestamp(cmd_i.get("timestamp", ""))
-
-        # Look forward for same base with different --format presence
-        has_format_i = "--format" in raw_i
-        for j in range(i + 1, n):
-            if j in reported:
-                continue
-            cmd_j = commands[j]
-            raw_j = cmd_j.get("command", "")
-            base_j = _normalize_caw_base(raw_j)
-            if base_j != base_i:
-                continue
-            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
-            if ts_j - ts_i > window_ms:
-                break
-            has_format_j = "--format" in raw_j
-            if has_format_i != has_format_j:
-                # Same base, one has --format and one doesn't → the one without is wasted
-                wasted_idx = i if not has_format_i else j
-                if wasted_idx not in reported:
-                    reported.add(wasted_idx)
-                    wasted.append({
-                        "index": wasted_idx,
-                        "type": "format_switch",
-                        "command": commands[wasted_idx]["command"][:80],
-                        "reason": "same caw operation retried to add/remove --format json"
-                    })
-
-    return wasted
-
-
-def _detect_repeat_calls(commands, conversation=None, threshold=3):
-    """
-    Detect caw commands with the same base operation repeated >= threshold times
-    without a user message in between.  These are wasted (after the first).
-
-    Polling/read operations are excluded — repeating caw onboard, caw status,
-    caw wallet balance etc. is expected agent behaviour, not waste.
-
-    Returns list of wasted-call dicts (type='caw_repeat').
-    """
-    # Read/query ops that are legitimately polled in a loop — skip these.
-    # Also includes tx get (status polling) and faucet deposit (may target
-    # different addresses each time — indistinguishable from caw span alone).
-    _POLLING_OPS = {
-        'caw onboard', 'caw status', 'caw tx list', 'caw tx get',
-        'caw wallet balance', 'caw pact list', 'caw pact show',
-        'caw wallet get', 'caw wallet current', 'caw address list',
-        'caw wallet list', 'caw wallet pair', 'caw wallet pair status',
-        'caw meta chains', 'caw faucet tokens', 'caw faucet deposit',
-    }
-
-    wasted = []
-    n = len(commands)
-
-    # Build user message timestamps for interleave check
-    user_ts_list = []
-    if conversation:
-        for turn in conversation:
-            if turn.get("role") == "user":
-                ts = parse_timestamp(turn.get("timestamp", ""))
-                if ts > 0:
-                    user_ts_list.append(ts)
-
-    def has_user_msg_between(ts_a, ts_b):
-        for uts in user_ts_list:
-            if ts_a < uts < ts_b:
-                return True
+    tool = cmd.get("tool", "")
+    # FIX: BUG-07 — exclude process:poll and process:log from meaningful command counts
+    if tool == "read":
         return False
-
-    reported = set()
-    i = 0
-    while i < n:
-        cmd = commands[i]
-        raw = cmd.get("command", "")
-        base = _normalize_caw_base(raw)       # for POLLING_OPS membership check
-        key = _caw_repeat_key(raw)             # for grouping (preserves --chain-id)
-        if base is None or base in _POLLING_OPS:
-            i += 1
-            continue
-        ts_i = parse_timestamp(cmd.get("timestamp", ""))
-
-        # Collect consecutive-ish same-key run (no user msg in between)
-        run = [i]
-        j = i + 1
-        while j < n:
-            cmd_j = commands[j]
-            raw_j = cmd_j.get("command", "")
-            base_j = _normalize_caw_base(raw_j)
-            key_j = _caw_repeat_key(raw_j)
-            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
-            if key_j == key and not has_user_msg_between(ts_i, ts_j):
-                run.append(j)
-                ts_i = ts_j
-                j += 1
-            else:
-                j += 1
-                break
-
-        if len(run) >= threshold:
-            # First call is legitimate; subsequent ones are wasted
-            for k in run[1:]:
-                if k not in reported:
-                    reported.add(k)
-                    wasted.append({
-                        "index": k,
-                        "type": "caw_repeat",
-                        "command": commands[k]["command"][:80],
-                        "reason": f"same caw operation repeated {len(run)}x without user input"
-                    })
-            i = run[-1] + 1
-        else:
-            i += 1
-
-    return wasted
+    if tool == "process":
+        try:
+            action = json.loads(cmd.get("command", "{}")).get("action")
+            if action in ("poll", "log"):
+                return False
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+    return True
 
 
-def _detect_silent_fail_probe(commands, conversation=None, window_ms=90_000):
-    """
-    Detect the pattern: caw exits 0 but agent immediately probes
-    (curl/grep/cat) to verify, suggesting it suspected a silent failure.
-    The probe call itself is the wasted cost.
-
-    Returns list of wasted-call dicts (type='silent_fail_probe').
-    """
-    wasted = []
-    probe_cmds = {"curl", "grep", "cat", "jq", "python3", "python"}
-    n = len(commands)
-
-    for i in range(n - 1):
-        cmd_i = commands[i]
-        base_i = _normalize_caw_base(cmd_i.get("command", ""))
-        if base_i is None:
-            continue
-        if cmd_i.get("exit_code", 0) != 0:
-            continue  # explicit failure, not silent
-        ts_i = parse_timestamp(cmd_i.get("timestamp", ""))
-
-        # Check if next meaningful command is a probe within window
-        for j in range(i + 1, n):
-            cmd_j = commands[j]
-            raw_j = cmd_j.get("command", "")
-            base_j = raw_j.split()[0] if raw_j else ""
-            ts_j = parse_timestamp(cmd_j.get("timestamp", ""))
-            if ts_j - ts_i > window_ms:
-                break
-            if base_j in probe_cmds:
-                # Check if the probe references something caw-related
-                if any(kw in raw_j for kw in ["wallet", "address", "pact", "balance", "chain"]):
-                    wasted.append({
-                        "index": j,
-                        "type": "silent_fail_probe",
-                        "command": raw_j[:80],
-                        "reason": f"agent probing after caw exit-0 to verify result"
-                    })
-                    break
-            elif _normalize_caw_base(raw_j) is not None:
-                break  # next caw command, not a probe
-
-    return wasted
-
-
-def detect_wasted_calls(commands, conversation=None):
+def detect_wasted_calls(commands):
     """
     Scan commands[] for unnecessary calls.
     Returns dict with total, by_type counts, waste_ratio, and details[].
@@ -1606,9 +1741,6 @@ def detect_wasted_calls(commands, conversation=None):
     - help_exploration: --help or help subcommand
     - flag_trial_error: same normalised command, different raw command (flag changes), all fail
     - env_probing: which <tool> or find -name <tool>
-    - format_switch: caw command retried only to add/remove --format json  [M8]
-    - caw_repeat: same caw base operation repeated ≥3x without user input  [M8]
-    - silent_fail_probe: curl/grep probe immediately after caw exit-0       [M8]
 
     NOT wasted: --version, polling_loop, exploration_loop, successful duplicates, read-only.
     """
@@ -1625,7 +1757,7 @@ def detect_wasted_calls(commands, conversation=None):
         norm = normalized[i]
         raw = cmd.get("command", "")
         exit_code = cmd.get("exit_code", 0)
-        base_cmd = (norm.split() or [""])[0] if norm else ""
+        base_cmd = norm.split()[0] if norm else ""
 
         # Skip empty / read-only
         if not norm or base_cmd in read_only:
@@ -1664,17 +1796,13 @@ def detect_wasted_calls(commands, conversation=None):
             continue
 
         # === Type 2b: version_check ===
-        # Exempt: installation verification — version check immediately before first onboard
         if "--version" in raw or norm.endswith(" version") or norm == "version":
-            lookahead_norms = normalized[i+1:i+6]
-            is_install_verify = any("onboard" in n for n in lookahead_norms)
-            if not is_install_verify:
-                wasted.append({
-                    "index": i,
-                    "type": "version_check",
-                    "command": raw[:80],
-                    "reason": "agent probing tool version"
-                })
+            wasted.append({
+                "index": i,
+                "type": "version_check",
+                "command": raw[:80],
+                "reason": "agent probing tool version"
+            })
             i += 1
             continue
 
@@ -1699,43 +1827,24 @@ def detect_wasted_calls(commands, conversation=None):
                 continue
 
         # === Type 4: env_probing ===
-        # Exempt: first 5 commands of session = legitimate environment discovery
-        _SESSION_START_THRESHOLD = 5
         if base_cmd == "which" or (base_cmd == "find" and "-name" in raw):
-            if i >= _SESSION_START_THRESHOLD:
-                wasted.append({
-                    "index": i,
-                    "type": "env_probing",
-                    "command": raw[:80],
-                    "reason": "agent searching for tool location"
-                })
+            wasted.append({
+                "index": i,
+                "type": "env_probing",
+                "command": raw[:80],
+                "reason": "agent searching for tool location"
+            })
             i += 1
             continue
 
         i += 1
 
-    # === M8: caw-specific redundancy detectors ===
-    m8_indices = set(w["index"] for w in wasted)
-
-    for w in _detect_format_switch(commands):
-        if w["index"] not in m8_indices:
-            wasted.append(w)
-            m8_indices.add(w["index"])
-
-    for w in _detect_repeat_calls(commands, conversation):
-        if w["index"] not in m8_indices:
-            wasted.append(w)
-            m8_indices.add(w["index"])
-
-    for w in _detect_silent_fail_probe(commands, conversation):
-        if w["index"] not in m8_indices:
-            wasted.append(w)
-            m8_indices.add(w["index"])
-
     # Compute summary
+    # FIX: BUG-07 — use is_meaningful_command to exclude process:poll/log
     meaningful_count = sum(
         1 for i, c in enumerate(commands)
-        if normalized[i] and (normalized[i].split() or [""])[0] not in read_only
+        if normalized[i] and normalized[i].split()[0] not in read_only
+        and is_meaningful_command(c)
     )
     by_type = {}
     for w in wasted:
@@ -1749,7 +1858,22 @@ def detect_wasted_calls(commands, conversation=None):
     }
 
 
-def detect_recovery_quality(commands, max_attempts=2):
+# FIX: BUG-04 — terminal error patterns that warrant correctly_abandoned classification
+TERMINAL_ERROR_PATTERNS = [
+    r"404 Not Found.*registry\.npmjs\.org",
+    r"npm error 404.*is not in this registry",
+    r"error: externally-managed-environment",
+    r"Permission denied.*(/usr|/opt|/etc)",
+    r"Read-only file system",
+]
+
+
+def is_terminal_error(error_text):
+    """Return True if error_text matches a known terminal/unrecoverable error pattern."""
+    return any(re.search(p, error_text, re.IGNORECASE) for p in TERMINAL_ERROR_PATTERNS)
+
+
+def detect_recovery_quality(commands, errors=None, max_attempts=2):
     """
     For each failed command, check if the same operation succeeds within
     max_attempts subsequent tries. Measures outcome, not just "did something different."
@@ -1759,12 +1883,15 @@ def detect_recovery_quality(commands, max_attempts=2):
     - Same normalised operation does NOT succeed within max_attempts → unresolved
     - Permission errors (403/forbidden) where agent stops trying → correctly_abandoned
       (excluded from both numerator and denominator)
+    - Terminal errors (npm 404, pip externally-managed) + different approach → correctly_abandoned
     - REQUIRE_APPROVAL → excluded (not an error)
     - Read-only command failures → excluded
     - Last error with no subsequent commands → excluded
 
     recovery_rate = resolved / (resolved + unresolved)
     """
+    if errors is None:
+        errors = []
     read_only = {'ls', 'cat', 'head', 'tail', 'echo', 'pwd', 'grep', 'rg'}
     approval_kw = ['require_approval', 'pending_approval', 'approval_required']
     permission_kw = ['403', 'permission', 'forbidden']
@@ -1782,7 +1909,7 @@ def detect_recovery_quality(commands, max_attempts=2):
 
         norm = normalized[i]
         raw = cmd.get("command", "")
-        base = (norm.split() or [""])[0] if norm else ""
+        base = norm.split()[0] if norm else ""
         error_text = cmd.get("output_text", "").lower()
 
         # Skip empty / read-only failures
@@ -1843,14 +1970,29 @@ def detect_recovery_quality(commands, max_attempts=2):
                 break
 
         if not attempts_after:
-            # Operation never attempted again — unresolved
+            # Operation never attempted again — check for terminal error first
+            # FIX: BUG-04 — terminal errors with alternative approach → correctly_abandoned
+            outcome = "unresolved"
+            reason = "operation never retried"
+            error_output = cmd.get("output_text", "") or error_text
+            if is_terminal_error(error_output):
+                # Check if subsequent commands take a different approach (different base command)
+                subsequent_cmds = commands[i + 1:]
+                has_different_approach = any(
+                    normalize_command(c.get("command", "")).split()[0:1] != [base]
+                    and c.get("tool", "") not in ("read",)
+                    for c in subsequent_cmds
+                ) if subsequent_cmds else False
+                if has_different_approach:
+                    outcome = "correctly_abandoned"
+                    reason = "terminal error — alternative approach taken"
             details.append({
                 "error_index": i,
                 "operation": norm,
                 "error_command": raw[:80],
-                "outcome": "unresolved",
+                "outcome": outcome,
                 "attempts": 0,
-                "reason": "operation never retried",
+                "reason": reason,
             })
         elif resolved:
             details.append({
@@ -1865,27 +2007,69 @@ def detect_recovery_quality(commands, max_attempts=2):
             total_after = len(attempts_after)
             # Check if it eventually succeeded (beyond window)
             eventually = any(commands[j].get("exit_code", 0) == 0 for j in attempts_after)
-            details.append({
-                "error_index": i,
-                "operation": norm,
-                "error_command": raw[:80],
-                "outcome": "unresolved",
-                "attempts": min(total_after, max_attempts),
-                "reason": f"not resolved within {max_attempts} attempts"
-                          + (f" (succeeded on attempt {total_after} — brute-forced)" if eventually else ""),
-            })
+            if eventually:
+                # FIX: BUG-05 — check for write/edit between first failure and eventual success
+                success_idx = next(j for j in attempts_after if commands[j].get("exit_code", 0) == 0)
+                intermediate_cmds = commands[i:success_idx]
+                write_edits = [c for c in intermediate_cmds if c.get("tool", "") in ("write", "edit")]
+                if write_edits:
+                    details.append({
+                        "error_index": i,
+                        "operation": norm,
+                        "error_command": raw[:80],
+                        "outcome": "resolved",
+                        "attempts": total_after,
+                        "reason": f"resolved (iterative fix, {total_after} attempts, {len(write_edits)} edits)",
+                    })
+                else:
+                    details.append({
+                        "error_index": i,
+                        "operation": norm,
+                        "error_command": raw[:80],
+                        "outcome": "unresolved",
+                        "attempts": min(total_after, max_attempts),
+                        "reason": f"succeeded on attempt {total_after} — brute-forced",
+                    })
+            else:
+                details.append({
+                    "error_index": i,
+                    "operation": norm,
+                    "error_command": raw[:80],
+                    "outcome": "unresolved",
+                    "attempts": min(total_after, max_attempts),
+                    "reason": f"not resolved within {max_attempts} attempts",
+                })
 
     resolved_count = sum(1 for d in details if d["outcome"] == "resolved")
     unresolved_count = sum(1 for d in details if d["outcome"] == "unresolved")
     abandoned_count = sum(1 for d in details if d["outcome"] == "correctly_abandoned")
     denominator = resolved_count + unresolved_count
 
+    # FIX: BUG-03 — handle evaluated=0 case with explicit note instead of defaulting to 1.0
+    total_evaluated = len(details)
+    if denominator == 0:
+        if total_evaluated == 0 and len(errors) == 0:
+            # No failures occurred at all
+            recovery_rate = 1.0
+            recovery_rate_note = "no_failures"
+        elif total_evaluated == 0:
+            # Errors exist but none were categorized as evaluated (e.g. all abandoned/skipped)
+            recovery_rate = None
+            recovery_rate_note = "not_evaluated"
+        else:
+            recovery_rate = 1.0
+            recovery_rate_note = "no_failures"
+    else:
+        recovery_rate = round(resolved_count / denominator, 3)
+        recovery_rate_note = "evaluated"
+
     return {
         "resolved": resolved_count,
         "unresolved": unresolved_count,
         "correctly_abandoned": abandoned_count,
-        "total_evaluated": len(details),
-        "recovery_rate": round(resolved_count / denominator, 3) if denominator > 0 else 1.0,
+        "total_evaluated": total_evaluated,
+        "recovery_rate": recovery_rate,
+        "recovery_rate_note": recovery_rate_note,
         "details": details,
     }
 
@@ -1954,8 +2138,11 @@ def detect_hallucinations(conversation, commands):
     # Step 2: cross-check
     details = []
     for claim in claims:
+        # FIX: BUG-13 — limit hallucination check to commands within 120s of claim
+        claim_ts_ms = parse_timestamp(claim["timestamp"])
         recent = [c for c in timed_cmds
                   if c["timestamp"] <= claim["timestamp"]
+                  and claim_ts_ms - parse_timestamp(c["timestamp"]) <= 120000  # 120 seconds
                   and (normalize_command(c.get("command", "")).split() or [""])[0] not in read_only]
         recent = recent[-5:]
 
@@ -1997,19 +2184,42 @@ def detect_hallucinations(conversation, commands):
     }
 
 
+def compute_goal_drift_warning(total_claims, recovery, wasted):
+    """
+    FIX: BUG-06 — add goal_drift_warning when task may be partial but agent claimed completion.
+    Triggers when total_claims > 0 AND (unresolved > 0 OR waste_ratio > 0.20).
+    """
+    if total_claims <= 0:
+        return None
+    unresolved = recovery.get("unresolved", 0)
+    waste_ratio = wasted.get("waste_ratio", 0)
+    if unresolved > 0 or waste_ratio > 0.20:
+        return "task may be partial — verify claim matches original goal"
+    return None
+
+
 def strip_internal_fields(commands):
     """Remove fields used only internally (output_text not part of output schema)."""
     return [{k: v for k, v in c.items() if k != "output_text"} for c in commands]
 
 
 def calculate_stats(events, commands, errors):
-    """Aggregate message counts and token/cost totals."""
+    """Aggregate message counts and token/cost totals.
+    Supports OpenClaw/CLI (type='message' with nested role) and Hermes (role at top level)."""
     user_messages = 0
     assistant_messages = 0
     total_tokens = 0
     total_cost = 0.0
 
     for e in events:
+        # Hermes format: role directly on event
+        if e.get('role') in ('user', 'assistant') and not e.get('type'):
+            if e['role'] == 'user':
+                user_messages += 1
+            else:
+                assistant_messages += 1
+            continue
+
         if e.get("type") != "message":
             continue
         msg = e.get("message", {})
@@ -2108,71 +2318,179 @@ def apply_time_filter(events, since_ts=None, until_ts=None):
 
 
 def analyze(path, since_arg=None, until_arg=None):
-    file_format = detect_format(path)
-    raw_trace_data = None
-    if file_format == 'trace':
-        with open(path, 'r', encoding='utf-8') as f:
-            raw_trace_data = json.load(f)
+    """Single-file mode: run Phase 1 and print JSON to stdout."""
+    try:
+        output = analyze_to_dict(path, since_arg=since_arg, until_arg=until_arg)
+    except ValueError as e:
+        print(json.dumps({"error": str(e)}), file=sys.stderr)
+        sys.exit(1)
+    print(json.dumps(output, indent=2))
 
+
+def analyze_to_dict(path, since_arg=None, until_arg=None):
+    """Run Phase 1 analysis and return result as dict (does not print)."""
     events = load_events(path)
     if not events:
-        print(json.dumps({"error": "Empty session file"}), file=sys.stderr)
-        sys.exit(1)
+        raise ValueError("Empty session file")
 
-    # Time range filtering
     if since_arg or until_arg:
         session_start_ms = parse_timestamp(events[0]["timestamp"])
         since_ts, until_ts = resolve_time_range(since_arg, until_arg, session_start_ms)
         events = apply_time_filter(events, since_ts, until_ts)
         if not events:
-            print(f"Error: no events found in specified time range", file=sys.stderr)
-            sys.exit(1)
+            raise ValueError("No events in specified time range")
 
     session = extract_session_meta(events)
-
-    # M10: For Langfuse traces, override active_duration_ms using turn:N span durations
-    # (convert_trace_to_events loses the raw span timing; recompute from raw data)
-    if raw_trace_data is not None:
-        session['active_duration_ms'] = compute_active_duration_trace(raw_trace_data)
-
     commands, tool_usage, errors = extract_tool_calls(events)
     timing = calculate_timing(events, commands, session["duration_ms"])
-    loops = detect_loops(commands)
+    loops, write_iterations = detect_loops(commands)
+    wasted = detect_wasted_calls(commands)
+    recovery = detect_recovery_quality(commands, errors=errors)
     conversation = extract_conversation(events)
-    wasted = detect_wasted_calls(commands, conversation)
-    recovery = detect_recovery_quality(commands)
     hallucinations = detect_hallucinations(conversation, commands)
+    hallucinations["goal_drift_warning"] = compute_goal_drift_warning(
+        hallucinations["total_claims"], recovery, wasted
+    )
     stats = calculate_stats(events, commands, errors)
     message_costs = extract_message_costs(events)
     thinking = extract_thinking(events)
+    stripped_commands = strip_internal_fields(commands)
+    timeline = build_timeline(conversation, stripped_commands, thinking=thinking)
 
-    exec_categories = build_exec_categories(commands)
-
-    output = {
+    return {
         "session": session,
         "stats": stats,
         "timing": timing,
         "loops": loops,
+        "write_iterations": write_iterations,
         "wasted_calls": wasted,
         "recovery": recovery,
         "hallucinations": hallucinations,
         "errors": errors,
-        "commands": strip_internal_fields(commands),
         "tool_usage": tool_usage,
-        "exec_categories": exec_categories,
-        "conversation": conversation,
-        "message_costs": message_costs,
-        "thinking": thinking,
+        "timeline": timeline,
+        # conversation[], commands[], thinking[], message_costs[] removed from output.
+        # timeline[] is the single source: filter by kind/label for each use case.
+        #   - Phase 2 transcript: kind=="thought", role in (user, assistant)
+        #   - Phase 4 window:     any kind, filtered by timestamp
+        #   - Phase 7 command log: kind=="command"
     }
-    print(json.dumps(output, indent=2))
+
+
+def _extract_metrics_row(filename, data):
+    """Extract a flat metrics dict for batch CSV output."""
+    import csv as _csv
+    tm = data.get("timing", {})
+    st = data.get("stats", {})
+    rec = data.get("recovery", {})
+    hall = data.get("hallucinations", {})
+    loops = data.get("loops", [])
+    wasted = data.get("wasted_calls", {})
+    wi = data.get("write_iterations", [])
+    # commands[] removed from output — read from timeline[] instead
+    timeline = data.get("timeline", [])
+    cmds = [e for e in timeline if e.get("kind") == "command"]
+
+    loop_counts = {}
+    for l in loops:
+        lt = l.get("loop_type", "unknown")
+        loop_counts[lt] = loop_counts.get(lt, 0) + 1
+
+    meaningful = [c for c in cmds if is_meaningful_command(c)]
+    exit0 = sum(1 for c in meaningful if c.get("exit_code") == 0)
+    efficiency = round(exit0 / len(meaningful) * 100) if meaningful else None
+    caw_count = sum(1 for c in cmds if c.get("tool", "").startswith("caw.") or c.get("tool_name", "").startswith("caw."))
+
+    return {
+        "filename": filename,
+        "duration_min": round(tm.get("total_ms", 0) / 60000, 1),
+        "turns": st.get("total_turns", 0),
+        "tool_calls": st.get("tool_calls", 0),
+        "caw_commands": caw_count,
+        "efficiency_pct": efficiency,
+        "recovery_rate": rec.get("recovery_rate"),
+        "recovery_note": rec.get("recovery_rate_note", ""),
+        "hallucinations": hall.get("hallucinations", 0),
+        "total_claims": hall.get("total_claims", 0),
+        "goal_drift_warning": 1 if hall.get("goal_drift_warning") else 0,
+        "error_loops": loop_counts.get("error_loop", 0),
+        "exploration_loops": loop_counts.get("exploration_loop", 0),
+        "debugging_loops": loop_counts.get("debugging_loop", 0),
+        "polling_loops": loop_counts.get("polling_loop", 0),
+        "write_iterations_count": len(wi),
+        "waste_ratio": wasted.get("waste_ratio", 0),
+    }
+
+
+def run_batch(dir_path, pattern="*.json", skip_existing=False):
+    """Batch Phase 1: process all matching files in dir, write _parser_output.json + batch_metrics.csv."""
+    import csv as _csv
+
+    files = sorted(Path(dir_path).glob(pattern))
+    files = [f for f in files if not f.name.endswith("_parser_output.json")
+             and not f.name.endswith("_report.md")]
+
+    rows = []
+    ok = failed = skipped = 0
+
+    for f in files:
+        out_path = f.with_name(f.stem + "_parser_output.json")
+
+        if skip_existing and out_path.exists():
+            try:
+                data = json.loads(out_path.read_text())
+                print(f"  skip  {f.name}", file=sys.stderr)
+                skipped += 1
+            except Exception as e:
+                print(f"  ERROR reading {out_path.name}: {e}", file=sys.stderr)
+                failed += 1
+                continue
+        else:
+            try:
+                data = analyze_to_dict(str(f))
+                out_path.write_text(json.dumps(data, indent=2))
+                print(f"  ✓     {f.name}", file=sys.stderr)
+                ok += 1
+            except Exception as e:
+                print(f"  FAIL  {f.name}: {e}", file=sys.stderr)
+                failed += 1
+                continue
+
+        rows.append(_extract_metrics_row(f.name, data))
+
+    if rows:
+        csv_path = Path(dir_path) / "batch_metrics.csv"
+        with open(csv_path, "w", newline="") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\n{ok} ok, {skipped} skipped, {failed} failed → {csv_path}", file=sys.stderr)
+    else:
+        print(f"\n{ok} ok, {skipped} skipped, {failed} failed (no output)", file=sys.stderr)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Analyze an OpenClaw session JSONL file."
+        description="Analyze session files (single or batch).",
+        usage="%(prog)s <path> [opts]  |  %(prog)s --dir <dir> [opts]"
     )
-    parser.add_argument("path", help="Path to session.jsonl")
+    parser.add_argument("path", nargs="?", help="Path to single session file")
+    parser.add_argument("--dir", help="Directory for batch Phase 1 processing")
+    parser.add_argument("--pattern", default="*.json",
+                        help="Glob pattern for --dir mode (default: *.json)")
+    parser.add_argument("--skip-existing", action="store_true",
+                        help="Skip files that already have _parser_output.json")
     parser.add_argument("--since", help="Start time filter: HH:MM or ISO timestamp")
     parser.add_argument("--until", help="End time filter: HH:MM or ISO timestamp")
     args = parser.parse_args()
-    analyze(args.path, since_arg=args.since, until_arg=args.until)
+
+    # Validate: exactly one of path or --dir required
+    if args.path and args.dir:
+        parser.error("specify either path or --dir, not both")
+    if not args.path and not args.dir:
+        parser.error("specify either path or --dir")
+
+    if args.dir:
+        run_batch(args.dir, pattern=args.pattern, skip_existing=args.skip_existing)
+    else:
+        analyze(args.path, since_arg=args.since, until_arg=args.until)

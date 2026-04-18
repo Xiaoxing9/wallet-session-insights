@@ -1,8 +1,40 @@
 # Changelog
 
+## v0.6.0 — 2026-04-16
+
+### Bug fixes: Parser accuracy (BUG-01 ~ BUG-09)
+
+- **BUG-01** `detect_loops`: all-exit-0 loops now classified as `exploration_loop` instead of `error_loop`
+- **BUG-02** `detect_loops`: `write`/`edit`/`read` tool calls excluded from loop detection; repeated writes to same path (≥3×) tracked separately as `write_iterations[]`
+- **BUG-03** `detect_recovery_quality`: `recovery_rate = null` + `recovery_rate_note = "not_evaluated"` when errors exist but none were evaluated; previously returned 1.0
+- **BUG-04** Recovery classification: terminal errors (npm 404, pip externally-managed-environment) → `correctly_abandoned` when agent took a different approach afterward
+- **BUG-05** Recovery classification: edit→retry pattern (write/edit calls between failure and eventual success) → `resolved (iterative fix)` instead of `unresolved (brute-forced)`
+- **BUG-06** Hallucinations: added `goal_drift_warning` structural signal when completion claims exist alongside partial/failed indicators
+- **BUG-07** `detect_wasted_calls`: `process` calls with `action=poll` or `action=log` excluded from meaningful command count
+- **BUG-08** Langfuse GENERATION spans: text output now extracted and included in `conversation[]`; previously only TURN-level output was captured, causing ~95% of assistant messages to be lost
+- **BUG-09** Langfuse `caw.*` spans: CAW CLI operations (caw.tx.call, caw.wallet.balance, caw.pact.show, etc.) now captured in `commands[]`; previously all caw CLI activity was invisible to the parser
+
+### Improvements
+
+- **Improvement 3** `detect_loops`: `debugging_loop` type added — error loop where write/edit calls appear between retries; penalised less harshly than `error_loop` in dim_ux (-3, cap -15 vs -5, cap -20)
+- **Improvement 4** `process_action` field added to all process tool commands in output
+- **Improvement 5** Output file naming convention documented in README
+- **Improvement 6** Regression test suite added: `tests/test_langfuse_parser.py` (4 tests covering BUG-01, 04, 08, 09)
+- **Improvement 7 (batch mode)** `--dir` flag: batch Phase 1 over a directory, writes `_parser_output.json` per file + `batch_metrics.csv`; `--skip-existing` for incremental runs; `analyze_to_dict()` internal refactor separates computation from stdout output
+
+### Breaking-ish changes
+
+- `detect_loops` now returns `(loops, write_iterations)` tuple instead of just `loops`; callers must unpack
+
+### Removed
+
+- Token cost tracking removed from SKILL.md: `message_costs[]` no longer read, cost fields removed from stats block, report template, and question pool. Parser still outputs `message_costs[]` for backwards compatibility but skill ignores it.
+
+---
+
 ## v0.5.0 — 2026-04-06
 
-### Feature: Multi-format session support + exec semantic classification + loop fix
+### Feature: Multi-format session support (OpenClaw + Claude Code CLI + Langfuse trace)
 
 **Formats supported:**
 - OpenClaw JSONL sessions (original format)
@@ -30,58 +62,9 @@
 - T3 (Claude Code CLI): 99 tool_calls ✅ (unchanged)
 - T4 (Langfuse trace): 134 tool_calls ✅ (newly verified)
 
-**Fix: `extract_conversation` empty for OpenClaw/CC-CLI sessions (found during 0404bugbash functional testing):**
-- Line 562: `e.get("type") != "message"` → `e.get("type") not in ("user", "assistant", "message")`
-- Root cause: v0.5.0 Langfuse multi-format changes accidentally narrowed the type guard to only `"message"`, but OpenClaw/CC-CLI events use `type: "user"` / `type: "assistant"`
-- Impact: `conversation[]` returned empty for all non-Langfuse sessions → task segmentation (Phase 2) worked from commands only, not dialogue
-- Verified: cfec0364 OpenClaw session → 0 → 64 conversation entries after fix
-
-**Fix: `detect_hallucinations` IndexError on empty command (found during 0404bugbash functional testing):**
-- Line 1541: `.split()[0]` → `(.split() or [""])[0]`
-- Triggered when `normalize_command()` returns empty string (e.g. Langfuse SPAN with empty input field)
-- Previously caused parser crash on traces bc255 and 65322
-
-**Fix: `active_duration_ms` redesign — event-type based, not threshold heuristic (M10):**
-- Previous approach: sum all inter-event gaps ≤ 5-minute threshold. Could not distinguish agent idle from human idle.
-- New approach for JSONL (OpenClaw/CC-CLI): subtract human idle gaps. A human idle gap = time from last `assistant` event to next `user` event carrying real human text (not a tool_result). Implemented as `compute_active_duration_jsonl(events)`.
-- New approach for Langfuse traces: sum durations of all `turn:N` spans. Each turn:N span covers one complete agent turn (LLM call + all tool executions). Implemented as `compute_active_duration_trace(raw_trace_data)`.
-- `analyze()` now detects Langfuse format before calling `load_events`, loads raw trace data, and overrides `session['active_duration_ms']` after `extract_session_meta` (which calls the JSONL path by default).
-- Verified: cfec0364 → 50.9m active of 2626.2m total (25 human turns, 2575m waiting for pact approval), trace-bc255 → 51.5m active of 98.2m total.
-
-**Fix: Loop classification bugs (found during functional testing):**
-- Default loop_type for all-success loops changed from `error_loop` to `exploration_loop`
-- polling_keywords expanded: added `"wait"`, `"generating"`, `"queued"`, `"polling"`, `"checking"`
-- Verified: `caw onboard` error_loop → polling_loop ✅, `pact list` unchanged ✅
-
-**Feature: exec semantic classification (`exec_categories`) — pending implementation:**
-
-Parser classifies exec commands into semantic categories for dim_depth breadth calculation:
-
-| Category | Match prefixes | Semantic |
-|----------|---------------|----------|
-| `wallet_pact` | `caw pact` | Authorization / approval |
-| `wallet_tx` | `caw tx`, `caw transfer` | On-chain transactions |
-| `wallet_track` | `caw track` | Transaction tracking |
-| `wallet_setup` | `caw onboard`, `caw status`, `caw wallet`, `caw profile` | Wallet lifecycle |
-| `wallet_query` | `caw address`, `caw meta`, `caw schema`, `caw faucet`, `caw demo` | Data queries |
-| `http_call` | `curl`, `wget` | HTTP calls |
-| `package_exec` | `npx`, `npm`, `pnpm`, `pip`, `pip3` | Package management |
-| `script` | `bash`, `python3`, `node`, `sh` | Script execution |
-| `file_ops` | `cat`, `ls`, `find`, `grep`, `head`, `tail`, `tree`, `wc` | File operations |
-| `git_ops` | `git` | Version control |
-| `other` | (fallback) | Unclassified |
-
-**Phase 3 dim_depth update** — unified breadth calculation across platforms:
-
-```
-effective_types = max(tool_types, len(exec_categories))
-```
-
-Uses `max()` (not conditional branch) so the same operations get the same score regardless of whether they run in OpenClaw or Claude Code CLI.
-
 ---
 
-## v0.2 — planned
+## v0.2
 
 ### Feature: Focus configuration
 

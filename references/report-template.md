@@ -15,14 +15,14 @@ If `--since` or `--until` was passed, include the range in the filename:
 ```markdown
 # Session Analysis: <session.id>
 
-**Quality: <score>/100 (<grade>)**  ·  <N>/<N> tasks  ·  <$X.XX/min or "—">/min
+**Quality: <score>/100 (<grade>)**  ·  <N>/<N> tasks
 ```
   Execution  <bar>  <dim_execution>
   Completion <bar>  <dim_completion>
   Depth      <bar>  <dim_depth>  (<depth_label>)
   UX         <bar>  <dim_ux>
 ```
-**Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys active>  *(wall-clock: <Xm Ys total>)*
+**Date:** <date> | **Model:** <model> | **Duration:** <Xm Ys>
 **User:** <user> | **CWD:** <cwd>
 [> *Generated in silent mode — no user input collected.*]
 [> *Time window: <HH:MM>–<HH:MM> — quality score covers this window only.*  (only when --since/--until)]
@@ -33,12 +33,9 @@ If `--since` or `--until` was passed, include the range in the filename:
 <LLM-generated — see prompts.md>
 
 ## Task Breakdown
-| # | Task | Duration | Cost | Efficiency | Status |
-|---|------|----------|------|------------|--------|
-<one row per task; cost = "—" when cost_unavailable; ⚠ on cost if high_burn; efficiency = "—" for null>
-
-<if high_burn: "> ⚠ Task N: high token burn rate ($X/min vs avg $X/min)">
-<if cost_unavailable: "> ⚠ Cost data unavailable — provider did not report token costs.">
+| # | Task | Duration | Efficiency | Status |
+|---|------|----------|------------|--------|
+<one row per task; efficiency = "—" for null>
 
 ## Issues
 
@@ -104,7 +101,7 @@ Duration for each row: `duration_ms` from `commands[]`, formatted as:
 | User response | <user_ms as Xm Ys> | <pct>% | — | — |
 | Idle / other  | <idle_ms as Xm Ys> | <pct>% | — | — |
 
-**Tokens:** <total_tokens> | **Cost:** <$X.XX | "N/A (not reported by provider)" if cost_unavailable>
+**Tokens:** <total_tokens | "N/A" if tokens_unavailable>
 
 ### Tool Usage
 | Tool | Calls |
@@ -131,7 +128,7 @@ For each match: `- **[pattern name]:** <command truncated to 60 chars> — <brie
 After writing the report, print:
 ```
 ✓ Report written to <output_path>
-  Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks  ·  $<X.XX>/min
+  Quality: <score>/100 (<grade>)  ·  <N>/<N> tasks
   Issues: <hallucinations> hallucinations, <unresolved> failed recoveries, <wasted> wasted calls
   Duration breakdown: LLM <pct>% / CLI <pct>% / User <pct>% / Idle <pct>%
 ```
